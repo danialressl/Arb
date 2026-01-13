@@ -1,0 +1,20 @@
+{
+  "quotes": [
+    {
+      "market_id": "kalshi-event-1",
+      "outcome": "YES",
+      "best_bid": 0.52,
+      "best_ask": 0.54,
+      "bid_size": 90,
+      "ask_size": 100
+    },
+    {
+      "market_id": "kalshi-event-1",
+      "outcome": "NO",
+      "best_bid": 0.44,
+      "best_ask": 0.45,
+      "bid_size": 90,
+      "ask_size": 110
+    }
+  ]
+}

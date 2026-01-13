@@ -1,0 +1,36 @@
+{
+  "quotes": [
+    {
+      "market_id": "poly-event-1-YES",
+      "outcome": "YES",
+      "best_bid": 0.44,
+      "best_ask": 0.45,
+      "bid_size": 100,
+      "ask_size": 120
+    },
+    {
+      "market_id": "poly-event-1-NO",
+      "outcome": "NO",
+      "best_bid": 0.54,
+      "best_ask": 0.55,
+      "bid_size": 80,
+      "ask_size": 90
+    },
+    {
+      "market_id": "poly-event-2-YES",
+      "outcome": "YES",
+      "best_bid": 0.62,
+      "best_ask": 0.64,
+      "bid_size": 50,
+      "ask_size": 60
+    },
+    {
+      "market_id": "poly-event-2-NO",
+      "outcome": "NO",
+      "best_bid": 0.36,
+      "best_ask": 0.38,
+      "bid_size": 50,
+      "ask_size": 60
+    }
+  ]
+}

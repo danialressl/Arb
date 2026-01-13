@@ -1,0 +1,19 @@
+events:
+  - canonical_event_id: "event-001"
+    notes: "Example mapping for a binary event (placeholder IDs)."
+    venues:
+      polymarket:
+        market_id: "poly-market-id"
+        yes_token_id: "poly-yes-token-id"
+        no_token_id: "poly-no-token-id"
+      kalshi:
+        ticker: "KALSHI-TICKER"
+  - canonical_event_id: "event-002"
+    notes: "Example mapping with Limitless stub (placeholder IDs)."
+    venues:
+      polymarket:
+        condition_id: "poly-condition-id"
+        yes_token_id: "poly-yes-token-id-2"
+        no_token_id: "poly-no-token-id-2"
+      limitless:
+        market_id: "limitless-event-2"
