@@ -75,10 +75,9 @@ async def run_live(config: AppConfig, sports_only: bool = False) -> None:
     poly_refs = [ref for event in events for ref in event.refs if ref.venue == "polymarket"]
     kalshi_refs = [ref for event in events for ref in event.refs if ref.venue == "kalshi"]
 
-    connectors = [
-        PolymarketConnector(config, on_update, poly_refs),
-        KalshiConnector(config, on_update, kalshi_refs),
-    ]
+    connectors = [PolymarketConnector(config, on_update, poly_refs)]
+    if config.kalshi_enabled:
+        connectors.append(KalshiConnector(config, on_update, kalshi_refs))
 
     async def connector_runner(connector) -> None:
         backoff = 1

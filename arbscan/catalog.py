@@ -37,11 +37,15 @@ logger = logging.getLogger(__name__)
 def scan_catalog(config: AppConfig, sports_only: bool = False) -> None:
     init_db(config.db_path)
 
-    mark_markets_closed(config.db_path, "kalshi")
+    if config.kalshi_enabled:
+        mark_markets_closed(config.db_path, "kalshi")
     mark_markets_closed(config.db_path, "polymarket")
 
     if sports_only:
-        kalshi_count, kalshi_kept, kalshi_samples = _ingest_kalshi_sports_markets(config)
+        if config.kalshi_enabled:
+            kalshi_count, kalshi_kept, kalshi_samples = _ingest_kalshi_sports_markets(config)
+        else:
+            kalshi_count, kalshi_kept, kalshi_samples = 0, 0, []
         poly_stats = _ingest_polymarket_sports_conditions(config)
         match_counts = _build_sports_market_matches(config)
         _log_sports_stats(
@@ -54,7 +58,7 @@ def scan_catalog(config: AppConfig, sports_only: bool = False) -> None:
         )
         return
 
-    kalshi_events = _fetch_kalshi_events(config)
+    kalshi_events = _fetch_kalshi_events(config) if config.kalshi_enabled else []
     poly_events = _fetch_polymarket_events(config)
 
     kalshi_groups = _ingest_kalshi_events(config, kalshi_events)
@@ -72,18 +76,18 @@ def scan_catalog(config: AppConfig, sports_only: bool = False) -> None:
         },
     }
 
-    logger.info(
-        "Catalog scan complete: %d Kalshi events, %d Polymarket events",
-        len(kalshi_groups),
-        len(poly_groups),
-    )
-    logger.info(
-        "Market counts: kalshi=%d/%d polymarket=%d/%d (open/total)",
-        market_counts["kalshi"]["open"],
-        market_counts["kalshi"]["total"],
-        market_counts["polymarket"]["open"],
-        market_counts["polymarket"]["total"],
-    )
+    # logger.info(
+    #     "Catalog scan complete: %d Kalshi events, %d Polymarket events",
+    #     len(kalshi_groups),
+    #     len(poly_groups),
+    # )
+    # logger.info(
+    #     "Market counts: kalshi=%d/%d polymarket=%d/%d (open/total)",
+    #     market_counts["kalshi"]["open"],
+    #     market_counts["kalshi"]["total"],
+    #     market_counts["polymarket"]["open"],
+    #     market_counts["polymarket"]["total"],
+    # )
     _log_quality_stats(kalshi_groups, poly_groups)
     _log_domain_stats(config)
     logger.info(
@@ -117,7 +121,7 @@ def _fetch_kalshi_events(config: AppConfig, with_nested_markets: bool = False) -
             retries += 1
             continue
         if status != 200 or not data:
-            logger.warning("Kalshi events fetch failed: %s", status)
+            # logger.warning("Kalshi events fetch failed: %s", status)
             break
         batch = data.get("events") or data.get("data") or []
         if not isinstance(batch, list):
@@ -131,15 +135,23 @@ def _fetch_kalshi_events(config: AppConfig, with_nested_markets: bool = False) -
     return events[:max_total]
 
 
-def _fetch_polymarket_events(config: AppConfig) -> List[dict]:
+def _fetch_polymarket_events(config: AppConfig, windowed: bool = False) -> List[dict]:
     url = f"{config.polymarket_gamma_url}/events"
     events = []
     offset = 0
     page_size = max(config.polymarket_scan_page_size, 1)
     max_total = max(config.polymarket_scan_limit, page_size)
+    max_pages = max(1, (max_total // page_size) * 5)
+    pages = 0
 
-    while offset < max_total:
-        params = {"active": "true", "limit": page_size, "offset": offset}
+    while offset < max_total and pages < max_pages:
+        params = {
+            "active": "true",
+            "closed": "false",
+            "archived": "false",
+            "limit": page_size,
+            "offset": offset,
+        }
         data, status = get_json(url, params=params, timeout=10)
         if status != 200 or not data:
             logger.warning("Polymarket events fetch failed: %s", status)
@@ -147,11 +159,51 @@ def _fetch_polymarket_events(config: AppConfig) -> List[dict]:
         batch = data.get("events") if isinstance(data, dict) else data
         if not isinstance(batch, list):
             break
-        events.extend(batch)
+        if windowed:
+            for event in batch:
+                if _event_in_window(
+                    event,
+                    config.sports_window_days,
+                    config.sports_window_past_days,
+                ):
+                    events.append(event)
+        else:
+            events.extend(batch)
         if len(batch) < page_size:
             break
         offset += page_size
+        pages += 1
     return events[:max_total]
+
+
+def _fetch_polymarket_sports_metadata(config: AppConfig) -> list:
+    url = f"{config.polymarket_gamma_url}/sports"
+    data, status = get_json(url, timeout=10)
+    if status != 200 or not data:
+        return []
+    if isinstance(data, dict):
+        return data.get("sports") or data.get("data") or []
+    if isinstance(data, list):
+        return data
+    return []
+
+
+def _polymarket_series_id_for_filter(
+    filter_value: Optional[str], config: AppConfig
+) -> Optional[str]:
+    if not filter_value:
+        return None
+    if filter_value.isdigit():
+        return filter_value
+    sports = _fetch_polymarket_sports_metadata(config)
+    filter_lower = filter_value.lower()
+    for sport in sports:
+        code = str(sport.get("sport") or "").lower()
+        if code == filter_lower:
+            series_id = sport.get("series")
+            if series_id:
+                return str(series_id)
+    return None
 
 
 def _fetch_polymarket_conditions(config: AppConfig) -> List[dict]:
@@ -182,7 +234,7 @@ def _fetch_polymarket_conditions(config: AppConfig) -> List[dict]:
 def _ingest_kalshi_events(config: AppConfig, events: List[dict]) -> List[EventGroup]:
     groups = []
     for idx, event in enumerate(events, start=1):
-        _log_progress("Kalshi event ingest", idx, len(events))
+        # _log_progress("Kalshi event ingest", idx, len(events))
         event_id = event.get("event_ticker") or event.get("ticker") or event.get("id")
         if not event_id:
             continue
@@ -190,7 +242,7 @@ def _ingest_kalshi_events(config: AppConfig, events: List[dict]) -> List[EventGr
             f"{config.kalshi_base_url}/events/{event_id}", timeout=config.kalshi_timeout_seconds
         )
         if status != 200 or not detail_raw:
-            logger.warning("Kalshi event detail fetch failed for %s: %s", event_id, status)
+            # logger.warning("Kalshi event detail fetch failed for %s: %s", event_id, status)
             continue
         detail = detail_raw.get("event") or detail_raw
         title = detail.get("title") or ""
@@ -353,7 +405,9 @@ def _ingest_kalshi_sports_markets(config: AppConfig) -> tuple[int, int, list]:
             close_time = _parse_time(
                 market.get("expected_expiration_time") or market.get("close_time")
             )
-            if not _within_sports_window(close_time, config.sports_window_days):
+            if not _within_sports_window(
+                close_time, config.sports_window_days, config.sports_window_past_days
+            ):
                 continue
             predicate = _parse_sports_predicate(label)
             if not predicate:
@@ -379,19 +433,19 @@ def _ingest_kalshi_sports_markets(config: AppConfig) -> tuple[int, int, list]:
                 market,
             )
         time.sleep(max(0.0, 1.0 / max(config.kalshi_rate_limit_per_second, 1.0)))
-    logger.info(
-        "Kalshi sports filter stats: markets=%d events_total=%d events_game=%d metadata_missing=%d metadata_not_game=%d events_with_tie=%d markets_seen=%d volume_filtered=%d label_filtered=%d predicate_failed=%d",
-        total,
-        stats["events_total"],
-        stats["events_game"],
-        stats["metadata_missing"],
-        stats["metadata_not_game"],
-        stats["events_with_tie"],
-        stats["markets_seen"],
-        stats["markets_volume_filtered"],
-        stats["markets_label_filtered"],
-        stats["markets_predicate_failed"],
-    )
+        # logger.info(
+        #     "Kalshi sports filter stats: markets=%d events_total=%d events_game=%d metadata_missing=%d metadata_not_game=%d events_with_tie=%d markets_seen=%d volume_filtered=%d label_filtered=%d predicate_failed=%d",
+        #     total,
+        #     stats["events_total"],
+        #     stats["events_game"],
+        #     stats["metadata_missing"],
+        #     stats["metadata_not_game"],
+        #     stats["events_with_tie"],
+        #     stats["markets_seen"],
+        #     stats["markets_volume_filtered"],
+        #     stats["markets_label_filtered"],
+        #     stats["markets_predicate_failed"],
+        # )
     return total, kept, samples
 
 
@@ -495,16 +549,27 @@ def _ingest_polymarket_events(config: AppConfig, events: List[dict]) -> List[Eve
 
 
 def _ingest_polymarket_sports_conditions(config: AppConfig) -> dict:
-    events = _fetch_polymarket_events(config)
+    events = _fetch_polymarket_events(config, windowed=True)
     total_events = len(events)
     total_conditions = 0
     kept = 0
     samples = []
+    stats = {
+        "events_sports": 0,
+        "markets_seen": 0,
+        "filtered_binary": 0,
+        "filtered_active": 0,
+        "filtered_league": 0,
+        "filtered_window": 0,
+        "predicate_failed": 0,
+    }
+    window_samples = []
+    kept_samples = []
 
     for event in events:
-        category = str(event.get("category") or "").lower()
-        if category != "sports":
+        if not _polymarket_is_game(event):
             continue
+        stats["events_sports"] += 1
         event_title = event.get("title") or event.get("question") or ""
         if not event_title:
             continue
@@ -513,33 +578,56 @@ def _ingest_polymarket_sports_conditions(config: AppConfig) -> dict:
             continue
         for market in markets:
             total_conditions += 1
+            stats["markets_seen"] += 1
             question = market.get("question") or market.get("title") or ""
             if len(samples) < 5 and question:
                 samples.append(question)
-            if not _is_sports_head_to_head(event_title) and not _is_sports_head_to_head(question):
-                continue
-            if _has_spread_terms(question) or _has_spread_terms(event_title):
-                continue
             if not _is_binary_condition(market):
+                stats["filtered_binary"] += 1
                 continue
             if not bool(market.get("active", True)):
+                stats["filtered_active"] += 1
                 continue
             if config.sports_league_filter_poly:
-                series_slug = str(event.get("seriesSlug") or "").lower()
-                if config.sports_league_filter_poly.lower() != series_slug:
+                if config.sports_league_filter_poly.lower() not in tag_slugs:
+                    stats["filtered_league"] += 1
                     continue
             outcomes = _extract_outcomes(market)
             predicate = _parse_sports_predicate(question, outcomes)
             if not predicate:
                 predicate = _parse_sports_predicate_from_event(event_title, question)
             if not predicate:
+                stats["predicate_failed"] += 1
                 continue
             close_time = _parse_time(market.get("endDate") or event.get("endDate"))
-            if not _within_sports_window(close_time, config.sports_window_days):
+            if not _within_sports_window(
+                close_time, config.sports_window_days, config.sports_window_past_days
+            ):
+                if len(window_samples) < 5:
+                    window_samples.append(
+                        {
+                            "event_title": event_title,
+                            "question": question,
+                            "endDate": market.get("endDate") or event.get("endDate"),
+                        }
+                    )
+                stats["filtered_window"] += 1
                 continue
             if close_time:
                 predicate["event_date"] = close_time.isoformat()
             kept += 1
+            if len(kept_samples) < 5:
+                kept_samples.append(
+                    {
+                        "event_title": event_title,
+                        "question": question,
+                        "predicate": predicate,
+                        "endDate": market.get("endDate") or event.get("endDate"),
+                        "volume24hr": market.get("volume24hr") or market.get("volume24hrClob"),
+                        "bestBid": market.get("bestBid"),
+                        "bestAsk": market.get("bestAsk"),
+                    }
+                )
             status_label = _status_for_close_time(close_time, is_active=True)
             event_id = event.get("slug") or event.get("id") or ""
             yes_token, no_token = _extract_poly_tokens_for_condition(market, outcomes)
@@ -559,12 +647,137 @@ def _ingest_polymarket_sports_conditions(config: AppConfig) -> dict:
                 market,
             )
 
+    if total_conditions == 0:
+        conditions = _fetch_polymarket_conditions(config)
+        total_conditions = len(conditions)
+        fallback_stats = {
+            "filtered_tags": 0,
+            "filtered_binary": 0,
+            "filtered_active": 0,
+            "filtered_closed": 0,
+            "filtered_league": 0,
+            "filtered_window": 0,
+            "predicate_failed": 0,
+            "kept": 0,
+        }
+        for condition in conditions:
+            tag_slugs = _polymarket_tag_slugs(condition)
+            if "games" not in tag_slugs:
+                fallback_stats["filtered_tags"] += 1
+                continue
+            question = condition.get("question") or condition.get("title") or ""
+            if len(samples) < 5 and question:
+                samples.append(question)
+            if not _is_binary_condition(condition):
+                fallback_stats["filtered_binary"] += 1
+                continue
+            if not bool(condition.get("active", True)):
+                fallback_stats["filtered_active"] += 1
+                continue
+            if bool(condition.get("closed")) or bool(condition.get("archived")):
+                fallback_stats["filtered_closed"] += 1
+                continue
+            event_title = ""
+            event_slug = ""
+            event_end = ""
+            events_meta = condition.get("events")
+            if isinstance(events_meta, list) and events_meta:
+                event_title = str(events_meta[0].get("title") or events_meta[0].get("question") or "")
+                event_slug = str(events_meta[0].get("slug") or "")
+                event_end = str(events_meta[0].get("endDate") or "")
+                event_tags = _polymarket_tag_slugs(events_meta[0])
+                if "sports" in event_tags:
+                    tag_slugs = tag_slugs.union(event_tags)
+            if config.sports_league_filter_poly:
+                if config.sports_league_filter_poly.lower() not in tag_slugs:
+                    fallback_stats["filtered_league"] += 1
+                    continue
+            outcomes = _extract_outcomes(condition)
+            predicate = _parse_sports_predicate(question, outcomes)
+            if not predicate and event_title:
+                predicate = _parse_sports_predicate_from_event(event_title, question)
+            if not predicate:
+                fallback_stats["predicate_failed"] += 1
+                continue
+            close_time = _parse_time(condition.get("endDate") or event_end)
+            if not _within_sports_window(
+                close_time, config.sports_window_days, config.sports_window_past_days
+            ):
+                fallback_stats["filtered_window"] += 1
+                continue
+            if close_time:
+                predicate["event_date"] = close_time.isoformat()
+            kept += 1
+            fallback_stats["kept"] += 1
+            status_label = _status_for_close_time(close_time, is_active=True)
+            yes_token, no_token = _extract_poly_tokens_for_condition(condition, outcomes)
+            market_id = str(condition.get("id") or condition.get("conditionId") or condition.get("condition_id") or "")
+            upsert_market(
+                config.db_path,
+                "polymarket",
+                market_id,
+                event_slug,
+                question,
+                "SPORTS_WINNER",
+                json.dumps(predicate, sort_keys=True),
+                close_time.isoformat() if close_time else None,
+                status_label,
+                condition.get("description") or "",
+                yes_token,
+                no_token,
+                condition,
+            )
+        logger.info(
+            "Polymarket fallback stats: tags_filtered=%d binary_filtered=%d active_filtered=%d closed_filtered=%d league_filtered=%d window_filtered=%d predicate_failed=%d kept=%d",
+            fallback_stats["filtered_tags"],
+            fallback_stats["filtered_binary"],
+            fallback_stats["filtered_active"],
+            fallback_stats["filtered_closed"],
+            fallback_stats["filtered_league"],
+            fallback_stats["filtered_window"],
+            fallback_stats["predicate_failed"],
+            fallback_stats["kept"],
+        )
+
+    logger.info(
+        "Polymarket sports filter stats: events=%d sports_events=%d markets_seen=%d binary_filtered=%d active_filtered=%d league_filtered=%d window_filtered=%d predicate_failed=%d",
+        total_events,
+        stats["events_sports"],
+        stats["markets_seen"],
+        stats["filtered_binary"],
+        stats["filtered_active"],
+        stats["filtered_league"],
+        stats["filtered_window"],
+        stats["predicate_failed"],
+    )
+    if window_samples:
+        logger.warning("Polymarket window-filter samples: %s", window_samples)
+    if kept_samples:
+        logger.info("Polymarket kept samples: %s", kept_samples)
     return {
         "events": total_events,
         "conditions": total_conditions,
         "kept": kept,
         "samples": samples,
     }
+
+
+def _polymarket_tag_slugs(item: dict) -> set:
+    tags = item.get("tags") or []
+    slugs = set()
+    for tag in tags:
+        if isinstance(tag, dict):
+            slug = tag.get("slug")
+            if slug:
+                slugs.add(str(slug).lower())
+        elif isinstance(tag, str):
+            slugs.add(tag.lower())
+    return slugs
+
+
+def _polymarket_is_game(item: dict) -> bool:
+    tag_slugs = _polymarket_tag_slugs(item)
+    return "games" in tag_slugs
 
 
 def _fetch_kalshi_event_metadata(config: AppConfig, event_ticker: str) -> Optional[dict]:
@@ -605,12 +818,25 @@ def _parse_time(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def _within_sports_window(value: Optional[datetime], window_days: int) -> bool:
+def _within_sports_window(value: Optional[datetime], window_days: int, past_days: int) -> bool:
     if not value:
         return False
     now = datetime.now(timezone.utc) if value.tzinfo else datetime.utcnow()
     delta = value - now
-    return timedelta(days=0) <= delta <= timedelta(days=window_days)
+    return timedelta(days=-past_days) <= delta <= timedelta(days=window_days)
+
+
+def _event_in_window(event: dict, window_days: int, past_days: int) -> bool:
+    for key in ("endDate", "gameStartTime", "startTime", "eventDate"):
+        value = event.get(key)
+        if value:
+            if key == "eventDate":
+                dt = _parse_time(f"{value}T00:00:00Z")
+            else:
+                dt = _parse_time(value)
+            if dt and _within_sports_window(dt, window_days, past_days):
+                return True
+    return False
 
 
 def _build_market_matches(config: AppConfig) -> dict:
@@ -708,11 +934,11 @@ def _build_sports_market_matches(config: AppConfig) -> dict:
 def _debug_sports_no_matches(kalshi_markets: list, poly_markets: list) -> None:
     kalshi_preds = _sample_predicates(kalshi_markets)
     poly_preds = _sample_predicates(poly_markets)
-    logger.warning(
-        "Sports matches=0. Kalshi predicates sample=%s Polymarket predicates sample=%s",
-        kalshi_preds,
-        poly_preds,
-    )
+        # logger.warning(
+        #     "Sports matches=0. Kalshi predicates sample=%s Polymarket predicates sample=%s",
+        #     kalshi_preds,
+        #     poly_preds,
+        # )
 
 
 def _sample_predicates(markets: list, limit: int = 5) -> list:
@@ -786,7 +1012,7 @@ def _fetch_kalshi_markets(
             retries += 1
             continue
         if status != 200 or not data:
-            logger.warning("Kalshi markets fetch failed: %s", status)
+            # logger.warning("Kalshi markets fetch failed: %s", status)
             break
         batch = data.get("markets") or data.get("data") or []
         if not isinstance(batch, list):
@@ -797,7 +1023,7 @@ def _fetch_kalshi_markets(
             break
         pages += 1
         if max_pages is not None and pages >= max_pages:
-            logger.info("Kalshi markets fetch capped at %d pages (sports-only).", max_pages)
+            # logger.info("Kalshi markets fetch capped at %d pages (sports-only).", max_pages)
             break
         time.sleep(max(0.0, 1.0 / max(config.kalshi_rate_limit_per_second, 1.0)))
     return markets
@@ -1171,11 +1397,11 @@ def _log_sports_stats(
     match_counts: dict,
     config: AppConfig,
 ) -> None:
-    logger.info(
-        "Sports ingest: kalshi_total=%d kalshi_kept=%d",
-        kalshi_total,
-        kalshi_kept,
-    )
+    # logger.info(
+    #     "Sports ingest: kalshi_total=%d kalshi_kept=%d",
+    #     kalshi_total,
+    #     kalshi_kept,
+    # )
     logger.info(
         "Sports ingest: polymarket_events=%d conditions=%d kept=%d",
         poly_stats["events"],
@@ -1195,7 +1421,7 @@ def _log_sports_stats(
     if match_counts["total"] == 0:
         logger.critical("No sports market_matches created.")
         logger.critical("Sample Polymarket labels: %s", poly_stats.get("samples", []))
-        logger.critical("Sample Kalshi labels: %s", kalshi_samples)
+        # logger.critical("Sample Kalshi labels: %s", kalshi_samples)
 
 
 def _extract_poly_tokens(market: dict) -> tuple[str, str]:
@@ -1215,11 +1441,11 @@ def _log_quality_stats(
 ) -> None:
     kalshi_lengths = [len(group.rules_text or "") for group in kalshi_groups]
     poly_lengths = [len(group.rules_text or "") for group in poly_groups]
-    logger.info(
-        "Kalshi event rules coverage: %d/%d non-empty",
-        sum(1 for length in kalshi_lengths if length > 0),
-        len(kalshi_lengths),
-    )
+    # logger.info(
+    #     "Kalshi event rules coverage: %d/%d non-empty",
+    #     sum(1 for length in kalshi_lengths if length > 0),
+    #     len(kalshi_lengths),
+    # )
     logger.info(
         "Polymarket event rules coverage: %d/%d non-empty",
         sum(1 for length in poly_lengths if length > 0),
