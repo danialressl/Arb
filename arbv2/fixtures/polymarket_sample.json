@@ -1,0 +1,13 @@
+{
+  "market": {
+    "id": "1030673",
+    "question": "Will Al Hilal Saudi Club win on 2026-01-12?",
+    "endDate": "2026-01-12T17:30:00Z",
+    "outcomes": "[\"Yes\", \"No\"]",
+    "sportsMarketType": "moneyline"
+  },
+  "event": {
+    "id": "125613",
+    "title": "Al Hilal Saudi Club vs. Al Nassr Saudi Club"
+  }
+}

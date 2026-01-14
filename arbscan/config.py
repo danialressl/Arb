@@ -33,6 +33,7 @@ class AppConfig:
 
     kalshi_api_key: Optional[str]
     kalshi_private_key_path: Optional[str]
+    kalshi_enabled: bool
 
     slack_webhook_url: Optional[str]
 
@@ -52,6 +53,7 @@ class AppConfig:
     kalshi_rate_limit_per_second: float
     kalshi_sports_min_volume_24h: float
     sports_window_days: int
+    sports_window_past_days: int
     sports_league_filter_kalshi: Optional[str]
     sports_league_filter_poly: Optional[str]
     kalshi_signing_mode: str
@@ -108,6 +110,7 @@ def load_config(mock_mode: bool = False) -> AppConfig:
         polymarket_l2_api_passphrase=os.getenv("POLYMARKET_L2_API_PASSPHRASE"),
         kalshi_api_key=os.getenv("KALSHI_API_KEY"),
         kalshi_private_key_path=os.getenv("KALSHI_PRIVATE_KEY_PATH"),
+        kalshi_enabled=os.getenv("KALSHI_ENABLED", "true").lower() == "true",
         slack_webhook_url=os.getenv("SLACK_WEBHOOK_URL"),
         fee_polymarket=_get_float("FEE_POLYMARKET", 0.0),
         fee_kalshi=_get_float("FEE_KALSHI", 0.0),
@@ -129,6 +132,7 @@ def load_config(mock_mode: bool = False) -> AppConfig:
         kalshi_rate_limit_per_second=_get_float("KALSHI_RATE_LIMIT_PER_SECOND", 5.0),
         kalshi_sports_min_volume_24h=_get_float("KALSHI_SPORTS_MIN_VOLUME_24H", 0.0),
         sports_window_days=_get_int("SPORTS_WINDOW_DAYS", 7),
+        sports_window_past_days=_get_int("SPORTS_WINDOW_PAST_DAYS", 1),
         sports_league_filter_kalshi=os.getenv("SPORTS_LEAGUE_FILTER_KALSHI"),
         sports_league_filter_poly=os.getenv("SPORTS_LEAGUE_FILTER_POLY"),
         kalshi_signing_mode=os.getenv("KALSHI_SIGNING_MODE", "none"),
