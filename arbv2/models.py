@@ -33,3 +33,5 @@ class MatchResult:
     polymarket_market_id: str
     equivalent: bool
     reason: str
+    kalshi_title: Optional[str] = None
+    polymarket_title: Optional[str] = None

@@ -84,7 +84,13 @@ def _run_match(config) -> int:
 
     upsert_predicates(config.db_path, kalshi_preds + poly_preds)
 
-    matches = match_predicates(kalshi_markets, poly_markets, kalshi_preds, poly_preds)
+    matches = match_predicates(
+        kalshi_markets,
+        poly_markets,
+        kalshi_preds,
+        poly_preds,
+        subset_matching=config.subset_matching_enabled,
+    )
     replace_matches(config.db_path, matches)
 
     logger.info("Predicates parsed: kalshi=%d polymarket=%d", len(kalshi_preds), len(poly_preds))

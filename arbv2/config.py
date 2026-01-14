@@ -1,5 +1,7 @@
 import os
 from dataclasses import dataclass
+def _env_truthy(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -14,6 +16,7 @@ class Config:
     max_event_time_delta_hours: int = int(os.getenv("ARBV2_EVENT_DELTA_HOURS", "24"))
     polymarket_games_tag_id: str = os.getenv("ARBV2_POLY_GAMES_TAG_ID", "100639")
     polymarket_series_ids: str = os.getenv("ARBV2_POLY_SERIES_IDS", "")
+    subset_matching_enabled: bool = _env_truthy(os.getenv("ARBV2_SUBSET_MATCHING", "true"))
 
 
 def load_config() -> Config:
