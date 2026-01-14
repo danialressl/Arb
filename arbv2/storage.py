@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS matches (
     kalshi_market_id TEXT NOT NULL,
     polymarket_market_id TEXT NOT NULL,
     reason TEXT,
+    kalshi_title TEXT,
+    polymarket_title TEXT,
     PRIMARY KEY (kalshi_market_id, polymarket_market_id)
 );
 """
@@ -58,6 +60,7 @@ def init_db(db_path: str) -> None:
         conn.executescript(SCHEMA)
         _migrate_markets_schema(conn)
         _migrate_predicates_schema(conn)
+        _migrate_matches_schema(conn)
         conn.commit()
     finally:
         conn.close()
@@ -143,10 +146,20 @@ def replace_matches(db_path: str, matches: Iterable[MatchResult]) -> None:
         conn.execute("DELETE FROM matches")
         conn.executemany(
             """
-            INSERT INTO matches (kalshi_market_id, polymarket_market_id, reason)
-            VALUES (?, ?, ?)
+            INSERT INTO matches (
+                kalshi_market_id, polymarket_market_id, reason, kalshi_title, polymarket_title
+            ) VALUES (?, ?, ?, ?, ?)
             """,
-            [(m.kalshi_market_id, m.polymarket_market_id, m.reason) for m in matches],
+            [
+                (
+                    m.kalshi_market_id,
+                    m.polymarket_market_id,
+                    m.reason,
+                    m.kalshi_title,
+                    m.polymarket_title,
+                )
+                for m in matches
+            ],
         )
         conn.commit()
     finally:
@@ -495,3 +508,11 @@ def _migrate_predicates_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("DROP TABLE predicates_old")
+
+
+def _migrate_matches_schema(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("PRAGMA table_info(matches)").fetchall()
+    if not rows:
+        return
+    _ensure_column(conn, "matches", "kalshi_title", "TEXT")
+    _ensure_column(conn, "matches", "polymarket_title", "TEXT")
