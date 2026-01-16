@@ -18,7 +18,12 @@ _TEAM_SEP_PATTERNS = [
 def parse_sports_predicate(market: Market) -> Optional[SportsPredicate]:
     event_title = market.event_title or ""
     title = market.title or ""
-    teams = _extract_teams(event_title) or _extract_teams(title)
+    teams = None
+    if market.venue == "polymarket" and market.raw_json:
+        description = market.raw_json.get("description")
+        teams = _extract_teams_from_description(description)
+    if not teams:
+        teams = _extract_teams(event_title) or _extract_teams(title)
     if not teams:
         return None
     team_a, team_b = teams
@@ -60,6 +65,23 @@ def _extract_teams(text: str) -> Optional[Tuple[str, str]]:
     return None
 
 
+def _extract_teams_from_description(description: Optional[str]) -> Optional[Tuple[str, str]]:
+    if not description:
+        return None
+    matches = re.findall(r'"([^"]+)"', description)
+    if len(matches) < 2:
+        return None
+    left = _clean_team_name(matches[0])
+    right = _clean_team_name(matches[1])
+    if left and left.strip().upper() in {"YES", "NO", "DRAW", "TIE"}:
+        return None
+    if right and right.strip().upper() in {"YES", "NO", "DRAW", "TIE"}:
+        return None
+    if left and right:
+        return left, right
+    return None
+
+
 def _extract_winner(title: str, market: Market) -> Optional[str]:
     if market.outcome_label:
         return str(market.outcome_label).strip()
@@ -85,6 +107,9 @@ def _clean_team_name(value: str) -> Optional[str]:
     if not value:
         return None
     text = value.strip()
+    text = re.sub(r"^will\s+.+?\s+win\s+(the\s+)?", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"^(the|a|an)\s+", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"\b(winner|win)\b\??$", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\b(match|game)\b\??$", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"\s+", " ", text).strip()
     return text or None
