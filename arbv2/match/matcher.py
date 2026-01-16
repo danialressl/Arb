@@ -9,7 +9,7 @@ from arbv2.teams import canonicalize_team
 
 logger = logging.getLogger(__name__)
 
-EventKey = Tuple[str, str, str]
+EventKey = Tuple[str, str, str, str]
 
 
 @dataclass
@@ -102,7 +102,8 @@ def _event_key_from_predicate(pred: SportsPredicate, market: Market) -> Optional
     if not team_a or not team_b:
         return None
     left, right = sorted([team_a, team_b])
-    return (left, right, market.event_date)
+    gender = _gender_key(market)
+    return (left, right, market.event_date, gender)
 
 
 def _group_by_outcome(markets: Iterable[Market]) -> Dict[str, List[Market]]:
@@ -145,6 +146,8 @@ def _match_event_keys(
 def _event_key_equivalent(left: EventKey, right: EventKey) -> bool:
     if left[2] != right[2]:
         return False
+    if left[3] != right[3]:
+        return False
     l1, l2 = left[0], left[1]
     r1, r2 = right[0], right[1]
     direct = _tokens_equivalent(l1, r1) and _tokens_equivalent(l2, r2)
@@ -156,6 +159,19 @@ def _event_key_equivalent(left: EventKey, right: EventKey) -> bool:
         _log_subset_match("EVENTKEY", l1, r2, left[2])
         _log_subset_match("EVENTKEY", l2, r1, left[2])
     return direct or swapped
+
+
+def _gender_key(market: Market) -> str:
+    if market.venue == "kalshi":
+        if str(market.series_ticker or "") == "KXNCAAWBGAME":
+            return "W"
+        return "M"
+    if market.venue == "polymarket":
+        title = str(market.title or "").strip()
+        if title.endswith("(W)"):
+            return "W"
+        return "M"
+    return "M"
 
 
 def _match_outcomes_by_subset(

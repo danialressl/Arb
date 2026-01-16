@@ -77,13 +77,13 @@ def _fetch_events(config: Config) -> List[Dict[str, object]]:
     series_ids = _series_ids(config)
     if not series_ids:
         series_ids = []
-    remaining = max(config.ingest_limit, 1)
+    remaining = config.ingest_limit if config.ingest_limit > 0 else None
     for series_id in series_ids:
-        if remaining <= 0:
+        if remaining is not None and remaining <= 0:
             break
         offset = 0
-        limit = min(1000, remaining)
-        while remaining > 0:
+        limit = 1000 if remaining is None else min(1000, remaining)
+        while True:
             params = {
                 "active": "true",
                 "closed": "false",
@@ -104,15 +104,18 @@ def _fetch_events(config: Config) -> List[Dict[str, object]]:
                 if isinstance(item, dict):
                     events.append(item)
             offset += len(data)
-            remaining -= len(data)
+            if remaining is not None:
+                remaining -= len(data)
+                if remaining <= 0:
+                    break
             if len(data) < limit:
                 break
     if events:
-        return events[: config.ingest_limit]
+        return events if config.ingest_limit <= 0 else events[: config.ingest_limit]
     # Fallback if series list is empty or returns nothing.
     offset = 0
-    limit = min(max(config.ingest_limit, 1), 1000)
-    while len(events) < config.ingest_limit:
+    limit = 1000 if config.ingest_limit <= 0 else min(max(config.ingest_limit, 1), 1000)
+    while config.ingest_limit <= 0 or len(events) < config.ingest_limit:
         params = {
             "active": "true",
             "closed": "false",
@@ -133,7 +136,7 @@ def _fetch_events(config: Config) -> List[Dict[str, object]]:
         offset += len(data)
         if len(data) < limit:
             break
-    return events[: config.ingest_limit]
+    return events if config.ingest_limit <= 0 else events[: config.ingest_limit]
 
 
 def _series_ids(config: Config) -> List[str]:

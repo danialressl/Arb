@@ -35,3 +35,15 @@ class MatchResult:
     reason: str
     kalshi_title: Optional[str] = None
     polymarket_title: Optional[str] = None
+
+
+@dataclass
+class PriceSnapshot:
+    venue: str
+    market_id: str
+    outcome_label: str
+    best_bid: Optional[float]
+    best_ask: Optional[float]
+    last_trade: Optional[float]
+    ts_utc: str
+    raw_json: Optional[Dict[str, Any]] = None

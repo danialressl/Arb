@@ -58,13 +58,13 @@ def ingest_kalshi(config: Config) -> List[Market]:
     for series_ticker in game_series:
         cursor = None
         series_count = 0
-        while len(markets) < config.ingest_limit:
+        while not _limit_reached(config.ingest_limit, len(markets)):
             data = _fetch_markets_page(config, series_ticker, cursor=cursor, limit=1000)
             batch = data.get("markets") or []
             if not batch:
                 break
             for market in batch:
-                if len(markets) >= config.ingest_limit:
+                if _limit_reached(config.ingest_limit, len(markets)):
                     break
                 if not isinstance(market, dict):
                     continue
@@ -107,7 +107,7 @@ def ingest_kalshi(config: Config) -> List[Market]:
             if not cursor:
                 break
         logger.info("Kalshi markets fetched series=%s count=%d", series_ticker, series_count)
-        if len(markets) >= config.ingest_limit:
+        if _limit_reached(config.ingest_limit, len(markets)):
             break
     logger.info("Kalshi markets kept total=%d", len(markets))
     if sample_titles:
@@ -201,6 +201,10 @@ def _write_cached_game_series(game_series: List[str]) -> None:
         _CACHE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except OSError:
         logger.warning("Kalshi series cache write failed: %s", _CACHE_PATH)
+
+
+def _limit_reached(limit: int, count: int) -> bool:
+    return limit > 0 and count >= limit
 
 
 def _normalize_kalshi_status(market: Dict[str, object]) -> Optional[str]:
