@@ -2,7 +2,7 @@ import re
 from typing import Optional, Tuple
 
 from arbv2.models import Market, SportsPredicate
-from arbv2.teams import canonicalize_team
+from arbv2.teams import canonicalize_team, league_hint_from_series_ticker, league_hint_from_text
 
 
 _TEAM_SEP_PATTERNS = [
@@ -27,8 +27,9 @@ def parse_sports_predicate(market: Market) -> Optional[SportsPredicate]:
     if not teams:
         return None
     team_a, team_b = teams
-    team_a = canonicalize_team(team_a)
-    team_b = canonicalize_team(team_b)
+    league_hint = _league_hint_for_market(market)
+    team_a = canonicalize_team(team_a, league_hint)
+    team_b = canonicalize_team(team_b, league_hint)
     if not team_a or not team_b:
         return None
     winner = _extract_winner(title, market)
@@ -109,7 +110,26 @@ def _clean_team_name(value: str) -> Optional[str]:
     text = value.strip()
     text = re.sub(r"^will\s+.+?\s+win\s+(the\s+)?", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"^(the|a|an)\s+", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\b(scheduled|schedule)\b.*$", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"\b(winner|win)\b\??$", "", text, flags=re.IGNORECASE).strip()
-    text = re.sub(r"\b(match|game)\b\??$", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\b(match|game|fight|bout)\b\??$", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\b(mma|ufc|boxing)\b\??$", "", text, flags=re.IGNORECASE).strip()
+    text = re.sub(r"\bprofessional\b\??$", "", text, flags=re.IGNORECASE).strip()
     text = re.sub(r"\s+", " ", text).strip()
     return text or None
+
+
+def _league_hint_for_market(market: Market) -> Optional[str]:
+    if market.venue == "kalshi":
+        if isinstance(market.raw_json, dict):
+            series_league = market.raw_json.get("series_league")
+            if series_league:
+                return str(series_league)
+        return league_hint_from_series_ticker(market.series_ticker)
+    if market.venue == "polymarket":
+        description = ""
+        if isinstance(market.raw_json, dict):
+            description = str(market.raw_json.get("description") or "")
+        text = " ".join([description, market.title or "", market.event_title or ""]).strip()
+        return league_hint_from_text(text)
+    return None

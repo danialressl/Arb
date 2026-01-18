@@ -4,13 +4,13 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import requests
 
 from arbv2.config import Config
 from arbv2.models import Market
-from arbv2.teams import canonicalize_team
+from arbv2.teams import canonicalize_team, league_hint_from_series_ticker, league_hint_from_url
 
 logger = logging.getLogger(__name__)
 
@@ -20,7 +20,7 @@ _CACHE_TTL_SECONDS = 24 * 60 * 60
 
 def ingest_kalshi(config: Config) -> List[Market]:
     markets: List[Market] = []
-    game_series = _load_cached_game_series()
+    game_series, series_leagues = _load_cached_game_series()
     if game_series:
         logger.info("Kalshi series cache hit games=%d path=%s", len(game_series), _CACHE_PATH)
     else:
@@ -28,6 +28,7 @@ def ingest_kalshi(config: Config) -> List[Market]:
         logger.info("Kalshi series total sports=%d", len(series_list))
         series_cache: Dict[str, Dict[str, object]] = {}
         game_series = []
+        series_leagues = {}
         checked_series = 0
         logged_series = 0
         for item in series_list:
@@ -48,14 +49,18 @@ def ingest_kalshi(config: Config) -> List[Market]:
             detail = _fetch_series_detail(config, str(ticker), series_cache)
             if _is_game_series(detail):
                 game_series.append(str(ticker))
+                league_hint = _league_hint_from_series_detail(detail)
+                if league_hint:
+                    series_leagues[str(ticker)] = league_hint
         logger.info("Kalshi series kept games=%d", len(game_series))
-        _write_cached_game_series(game_series)
+        _write_cached_game_series(game_series, series_leagues)
     if not game_series:
         logger.warning("Kalshi ingest found no game series")
         return markets
 
     sample_titles: List[str] = []
     for series_ticker in game_series:
+        league_hint = series_leagues.get(series_ticker) or league_hint_from_series_ticker(series_ticker)
         cursor = None
         series_count = 0
         while not _limit_reached(config.ingest_limit, len(markets)):
@@ -82,7 +87,10 @@ def ingest_kalshi(config: Config) -> List[Market]:
                 market_type = "sports_moneyline"
                 status = _normalize_kalshi_status(market)
                 event_date = _kalshi_event_date(market)
-                outcome_label = _kalshi_outcome_label(market)
+                outcome_label = _kalshi_outcome_label(market, league_hint)
+                raw_market = dict(market)
+                if league_hint:
+                    raw_market["series_league"] = league_hint
                 if _title_looks_wrong(str(title)):
                     logger.error("Kalshi market title looks like outcome text: %s", title)
                 markets.append(
@@ -97,7 +105,7 @@ def ingest_kalshi(config: Config) -> List[Market]:
                         status=status,
                         event_date=event_date,
                         outcome_label=outcome_label,
-                        raw_json=market,
+                        raw_json=raw_market,
                     )
                 )
                 series_count += 1
@@ -171,33 +179,54 @@ def _is_game_series(series_detail: Dict[str, object]) -> bool:
     return str(scope).strip() == "Game"
 
 
+def _league_hint_from_series_detail(series_detail: Dict[str, object]) -> Optional[str]:
+    sources = series_detail.get("settlement_sources") or []
+    if not isinstance(sources, list):
+        return None
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        hint = league_hint_from_url(source.get("url"))
+        if hint:
+            return hint
+    return None
+
+
 def _title_looks_wrong(title: str) -> bool:
     lower = title.lower()
     return lower.count("yes ") >= 2 or "," in title
 
 
-def _load_cached_game_series() -> List[str]:
+def _load_cached_game_series() -> Tuple[List[str], Dict[str, str]]:
     if not _CACHE_PATH.exists():
-        return []
+        return [], {}
     try:
         data = json.loads(_CACHE_PATH.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return []
+        return [], {}
     generated_at = data.get("generated_at")
     if not isinstance(generated_at, (int, float)):
-        return []
+        return [], {}
     if time.time() - float(generated_at) > _CACHE_TTL_SECONDS:
-        return []
+        return [], {}
     series = data.get("game_series")
     if not isinstance(series, list):
-        return []
-    return [str(item) for item in series if isinstance(item, str) and item.strip()]
+        return [], {}
+    leagues = data.get("series_leagues")
+    league_map = leagues if isinstance(leagues, dict) else {}
+    return [str(item) for item in series if isinstance(item, str) and item.strip()], {
+        str(key): str(value) for key, value in league_map.items() if key and value
+    }
 
 
-def _write_cached_game_series(game_series: List[str]) -> None:
+def _write_cached_game_series(game_series: List[str], series_leagues: Dict[str, str]) -> None:
     try:
         _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        payload = {"generated_at": int(time.time()), "game_series": game_series}
+        payload = {
+            "generated_at": int(time.time()),
+            "game_series": game_series,
+            "series_leagues": series_leagues,
+        }
         _CACHE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     except OSError:
         logger.warning("Kalshi series cache write failed: %s", _CACHE_PATH)
@@ -224,12 +253,12 @@ def _kalshi_event_date(market: Dict[str, object]) -> Optional[str]:
     return _to_utc_date(value)
 
 
-def _kalshi_outcome_label(market: Dict[str, object]) -> Optional[str]:
+def _kalshi_outcome_label(market: Dict[str, object], league_hint: Optional[str]) -> Optional[str]:
     value = market.get("yes_sub_title") or market.get("yes_subtitle")
-    return _normalize_outcome(value)
+    return _normalize_outcome(value, league_hint)
 
 
-def _normalize_outcome(value: Optional[str]) -> Optional[str]:
+def _normalize_outcome(value: Optional[str], league_hint: Optional[str]) -> Optional[str]:
     if not value:
         return None
     text = re.sub(r"[^\w\s]", " ", str(value).upper())
@@ -238,7 +267,7 @@ def _normalize_outcome(value: Optional[str]) -> Optional[str]:
         return None
     if text in {"TIE", "DRAW"}:
         return "DRAW"
-    return canonicalize_team(text)
+    return canonicalize_team(text, league_hint)
 
 
 def _to_utc_date(value: Optional[str]) -> Optional[str]:

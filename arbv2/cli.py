@@ -22,10 +22,20 @@ from arbv2.pricing.polymarket import (
     validate_clob_auth,
 )
 from arbv2.pricing.kalshi import poll_markets
-from arbv2.pricing.arb import ArbMode, EventMarkets, ORDERBOOKS, Q_MIN, evaluate_profit_at_size, evaluate_profit_rows, find_best_arb
+from arbv2.pricing.arb import (
+    ArbMode,
+    EventMarkets,
+    ORDERBOOKS,
+    Q_MIN,
+    evaluate_profit_at_size,
+    evaluate_profit_rows,
+    find_best_arb,
+    should_emit_signal,
+)
 from arbv2.storage import (
     fetch_markets,
     fetch_match_pairs,
+    fetch_predicates,
     fetch_matched_market_ids,
     init_db,
     insert_prices,
@@ -83,6 +93,20 @@ def main() -> int:
         default=3600,
         help="Seconds between ingest+match runs",
     )
+    live_parser = sub.add_parser(
+        "live",
+        help="Loop ingest+match and run price streams in the same process",
+    )
+    live_parser.add_argument("--kalshi", action="store_true", help="Stream Kalshi prices")
+    live_parser.add_argument("--polymarket", action="store_true", help="Stream Polymarket prices")
+    live_parser.add_argument("--limit", type=int, default=None)
+    live_parser.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=3600,
+        help="Seconds between ingest+match refreshes",
+    )
+    live_parser.add_argument("--poll-seconds", type=int, default=1, help="Kalshi poll cadence in seconds")
 
     args = parser.parse_args()
     config = load_config()
@@ -100,6 +124,8 @@ def main() -> int:
         return _run_arb(config, args)
     if args.cmd == "run":
         return _run_loop(config, args.interval_seconds)
+    if args.cmd == "live":
+        return _run_live(config, args)
     return 1
 
 
@@ -188,50 +214,12 @@ def _run_price(config, args) -> int:
         args.kalshi = True
     if not args.snapshot and not args.stream:
         args.snapshot = True
-    poly_token_map = None
-    kalshi_markets = None
-
-    if args.polymarket:
-        validate_clob_auth(config)
-        matched_ids = fetch_matched_market_ids(config.db_path, venue="polymarket")
-        markets = fetch_markets(config.db_path, venue="polymarket")
-        markets = [m for m in markets if m.market_id in matched_ids]
-        if not markets:
-            logger.warning("No matched Polymarket markets found; run match first.")
-            return 0
-        poly_token_map = build_token_map(markets)
-        if args.limit:
-            poly_token_map = dict(list(poly_token_map.items())[: args.limit])
-        if args.snapshot:
-            snapshots = []
-            total = len(poly_token_map)
-            checked = 0
-            for token_id, targets in poly_token_map.items():
-                checked += 1
-                snaps = fetch_book_snapshot(config, token_id, targets)
-                if snaps:
-                    snapshots.extend(snaps)
-                if checked % 50 == 0 or checked == total:
-                    logger.info(
-                        "Polymarket snapshot progress: checked=%d/%d saved=%d",
-                        checked,
-                        total,
-                        len(snapshots),
-                    )
-            if snapshots:
-                insert_prices(config.db_path, snapshots)
-                logger.info("Polymarket price snapshots: %d", len(snapshots))
-
-    if args.kalshi:
-        matched_ids = fetch_matched_market_ids(config.db_path, venue="kalshi")
-        markets = fetch_markets(config.db_path, venue="kalshi")
-        markets = [m for m in markets if m.market_id in matched_ids]
-        if not markets:
-            logger.warning("No matched Kalshi markets found; run match first.")
-            return 0
-        if args.limit:
-            markets = markets[: args.limit]
-        kalshi_markets = markets
+    poly_token_map, kalshi_markets = _build_price_targets(
+        config,
+        enable_polymarket=args.polymarket,
+        enable_kalshi=args.kalshi,
+        limit=args.limit,
+    )
 
     if args.stream:
         try:
@@ -254,6 +242,42 @@ def _run_price(config, args) -> int:
     return 0
 
 
+def _build_price_targets(
+    config,
+    *,
+    enable_polymarket: bool,
+    enable_kalshi: bool,
+    limit: Optional[int],
+):
+    poly_token_map = None
+    kalshi_markets = None
+
+    if enable_polymarket:
+        validate_clob_auth(config)
+        matched_ids = fetch_matched_market_ids(config.db_path, venue="polymarket")
+        markets = fetch_markets(config.db_path, venue="polymarket")
+        markets = [m for m in markets if m.market_id in matched_ids]
+        if markets:
+            poly_token_map = build_token_map(markets)
+            if limit:
+                poly_token_map = dict(list(poly_token_map.items())[: limit])
+        else:
+            logger.warning("No matched Polymarket markets found; run match first.")
+
+    if enable_kalshi:
+        matched_ids = fetch_matched_market_ids(config.db_path, venue="kalshi")
+        markets = fetch_markets(config.db_path, venue="kalshi")
+        markets = [m for m in markets if m.market_id in matched_ids]
+        if markets:
+            if limit:
+                markets = markets[: limit]
+            kalshi_markets = markets
+        else:
+            logger.warning("No matched Kalshi markets found; run match first.")
+
+    return poly_token_map, kalshi_markets
+
+
 def _run_arb(config, args) -> int:
     init_db(config.db_path)
     kalshi_markets = fetch_markets(config.db_path, venue="kalshi")
@@ -270,7 +294,7 @@ def _run_arb(config, args) -> int:
             events = events[: args.limit]
         for event in events:
             signal = find_best_arb(event, mode)
-            if signal:
+            if signal and should_emit_signal(event, mode, signal):
                 signals.append(signal)
     else:
         events = _build_binary_events(config.db_path)
@@ -278,7 +302,7 @@ def _run_arb(config, args) -> int:
             events = events[: args.limit]
         for event in events:
             signal = find_best_arb(event, mode)
-            if signal:
+            if signal and should_emit_signal(event, mode, signal):
                 signals.append(signal)
 
     for signal in signals[:10]:
@@ -351,6 +375,80 @@ async def _run_arb_stream(config) -> None:
         await asyncio.sleep(2)
 
 
+def _run_live(config, args) -> int:
+    init_db(config.db_path)
+    if not args.polymarket and not args.kalshi:
+        args.polymarket = True
+        args.kalshi = True
+    if args.interval_seconds <= 0:
+        logger.warning("Interval must be positive; got %d", args.interval_seconds)
+        return 0
+    try:
+        asyncio.run(
+            _run_live_loop(
+                config,
+                enable_polymarket=args.polymarket,
+                enable_kalshi=args.kalshi,
+                interval_seconds=args.interval_seconds,
+                poll_seconds=args.poll_seconds,
+                limit=args.limit,
+            )
+        )
+    except KeyboardInterrupt:
+        logger.info("Live loop stopped")
+    return 0
+
+
+async def _run_live_loop(
+    config,
+    *,
+    enable_polymarket: bool,
+    enable_kalshi: bool,
+    interval_seconds: int,
+    poll_seconds: int,
+    limit: Optional[int],
+) -> None:
+    cycle = 0
+    while True:
+        cycle += 1
+        logger.info("Live cycle %d: ingest+match", cycle)
+        _run_ingest(config, True, True)
+        _run_match(config)
+        poly_token_map, kalshi_markets = _build_price_targets(
+            config,
+            enable_polymarket=enable_polymarket,
+            enable_kalshi=enable_kalshi,
+            limit=limit,
+        )
+        ORDERBOOKS.clear()
+        tasks = []
+        if enable_polymarket and poly_token_map:
+            tasks.append(asyncio.create_task(stream_poly_books(config, poly_token_map, config.db_path)))
+        if enable_kalshi and kalshi_markets:
+            tasks.append(
+                asyncio.create_task(
+                    poll_markets(
+                        config,
+                        kalshi_markets,
+                        config.db_path,
+                        poll_seconds=poll_seconds,
+                        run_once=False,
+                    )
+                )
+            )
+        tasks.append(asyncio.create_task(_run_arb_stream(config)))
+        if not tasks:
+            logger.warning("No price streams to run; sleeping %d seconds", interval_seconds)
+            await asyncio.sleep(interval_seconds)
+            continue
+        try:
+            await asyncio.sleep(interval_seconds)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
 def _scan_arb_events(db_path: str, events: List[EventMarkets], mode: ArbMode) -> None:
     scan_rows: List[tuple] = []
     best_by_key: Dict[tuple, tuple] = {}
@@ -370,6 +468,8 @@ def _scan_arb_events(db_path: str, events: List[EventMarkets], mode: ArbMode) ->
                 )
         signal = find_best_arb(event, mode)
         if not signal:
+            continue
+        if not should_emit_signal(event, mode, signal):
             continue
         _append_arb_csv(signal, "arbv2_arbs.csv")
         logger.info(
@@ -522,12 +622,13 @@ def _build_event_markets(
         p_map = {m.outcome_label: m.market_id for m in p_group if m.outcome_label in outcomes}
         if set(k_map.keys()) != set(outcomes) or set(p_map.keys()) != set(outcomes):
             continue
+        event_key = _event_key_str(key)
         events.append(
             EventMarkets(
                 kalshi_by_outcome=k_map,
                 polymarket_by_outcome=p_map,
                 outcomes=outcomes,
-                event_id=None,
+                event_id=event_key,
             )
         )
     return events
@@ -535,36 +636,67 @@ def _build_event_markets(
 
 def _build_binary_events(db_path: str) -> List[EventMarkets]:
     pairs = fetch_match_pairs(db_path)
+    markets = fetch_markets(db_path)
+    preds = fetch_predicates(db_path)
+    key_map = _market_event_key_map(markets, preds)
+    outcome_map = {m.market_id: m.outcome_label for m in markets}
     events: List[EventMarkets] = []
     for kalshi_id, poly_id in pairs:
+        event_key = key_map.get(kalshi_id) or key_map.get(poly_id)
+        outcome_id = outcome_map.get(kalshi_id) or outcome_map.get(poly_id)
         events.append(
             EventMarkets(
                 kalshi_by_outcome={"YES": kalshi_id, "NO": kalshi_id},
                 polymarket_by_outcome={"YES": poly_id, "NO": poly_id},
                 outcomes=["YES", "NO"],
-                event_id=None,
+                event_id=event_key,
+                outcome_id=outcome_id,
             )
         )
     return events
 
 
-def _group_by_event_key(
-    markets: List[Market], preds: List[SportsPredicate]
-) -> Dict[tuple, List[Market]]:
+def _event_key_tuple(market: Market, pred: SportsPredicate) -> Optional[tuple]:
+    if not market.event_date:
+        return None
+    team_a = canonicalize_team(pred.team_a)
+    team_b = canonicalize_team(pred.team_b)
+    if not team_a or not team_b:
+        return None
+    left, right = sorted([team_a, team_b])
+    return (left, right, market.event_date, _gender_key(market))
+
+
+def _event_key_str(key: tuple) -> str:
+    return "|".join(str(part) for part in key)
+
+
+def _group_by_event_key(markets: List[Market], preds: List[SportsPredicate]) -> Dict[tuple, List[Market]]:
     pred_by_id = {pred.market_id: pred for pred in preds}
     grouped: Dict[tuple, List[Market]] = {}
     for market in markets:
         pred = pred_by_id.get(market.market_id)
-        if not pred or not market.event_date:
+        if not pred:
             continue
-        team_a = canonicalize_team(pred.team_a)
-        team_b = canonicalize_team(pred.team_b)
-        if not team_a or not team_b:
+        key = _event_key_tuple(market, pred)
+        if not key:
             continue
-        left, right = sorted([team_a, team_b])
-        key = (left, right, market.event_date, _gender_key(market))
         grouped.setdefault(key, []).append(market)
     return grouped
+
+
+def _market_event_key_map(markets: List[Market], preds: List[SportsPredicate]) -> Dict[str, str]:
+    pred_by_id = {pred.market_id: pred for pred in preds}
+    mapping: Dict[str, str] = {}
+    for market in markets:
+        pred = pred_by_id.get(market.market_id)
+        if not pred:
+            continue
+        key = _event_key_tuple(market, pred)
+        if not key:
+            continue
+        mapping[market.market_id] = _event_key_str(key)
+    return mapping
 
 
 def _gender_key(market: Market) -> str:

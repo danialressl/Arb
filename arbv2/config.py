@@ -16,6 +16,7 @@ class Config:
     max_event_time_delta_hours: int = int(os.getenv("ARBV2_EVENT_DELTA_HOURS", "24"))
     polymarket_games_tag_id: str = os.getenv("ARBV2_POLY_GAMES_TAG_ID", "100639")
     polymarket_series_ids: str = os.getenv("ARBV2_POLY_SERIES_IDS", "")
+    polymarket_series_id_overrides: str = os.getenv("ARBV2_POLY_SERIES_ID_OVERRIDES", "10500=38")
     subset_matching_enabled: bool = _env_truthy(os.getenv("ARBV2_SUBSET_MATCHING", "true"))
     polymarket_clob_rest_url: str = os.getenv("POLY_CLOB_REST_URL", "https://clob.polymarket.com")
     polymarket_clob_ws_url: str = os.getenv("POLY_CLOB_WS_URL", "wss://ws-subscriptions-clob.polymarket.com")
