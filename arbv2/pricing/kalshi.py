@@ -30,7 +30,7 @@ async def poll_markets(
         snapshots = await asyncio.to_thread(_fetch_markets, config, tickers, market_by_id)
         if snapshots:
             insert_prices(db_path, snapshots)
-            logger.info("Kalshi market updates: %d", len(snapshots))
+            logger.debug("Kalshi market updates: %d", len(snapshots))
         if run_once:
             break
         await asyncio.sleep(poll_seconds)

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Iterable, List, Optional, Tuple
 
 from arbv2.models import Market, MatchResult, PriceSnapshot, SportsPredicate
-from arbv2.teams import canonicalize_team
+from arbv2.teams import canonicalize_team, league_hint_from_series_ticker, league_hint_from_text, league_hint_from_url
 
 
 logger = logging.getLogger(__name__)
@@ -519,21 +519,27 @@ def _extract_event_date(venue: str, raw_json: dict) -> Optional[str]:
 def _extract_outcome_label(venue: str, raw_json: dict) -> Optional[str]:
     if venue == "kalshi":
         value = raw_json.get("yes_sub_title") or raw_json.get("yes_subtitle")
-        return _normalize_outcome(value)
+        league_hint = raw_json.get("series_league") or league_hint_from_series_ticker(raw_json.get("series_ticker"))
+        return _normalize_outcome(value, league_hint)
     if venue == "polymarket":
         question = str(raw_json.get("question") or "")
         group_title = str(raw_json.get("groupItemTitle") or "")
+        league_hint = league_hint_from_url(raw_json.get("resolutionSource"))
+        if not league_hint:
+            league_hint = league_hint_from_text(str(raw_json.get("description") or "")) or league_hint_from_text(
+                " ".join([question, group_title])
+            )
         if "draw" in question.lower() or "draw" in group_title.lower():
             return "DRAW"
         if "tie" in question.lower() or "tie" in group_title.lower():
             return "DRAW"
         match = re.search(r"will\s+(.+?)\s+win", question, re.IGNORECASE)
         if match:
-            return _normalize_outcome(match.group(1))
+            return _normalize_outcome(match.group(1), league_hint)
     return None
 
 
-def _normalize_outcome(value: Optional[str]) -> Optional[str]:
+def _normalize_outcome(value: Optional[str], league_hint: Optional[str]) -> Optional[str]:
     if not value:
         return None
     text = re.sub(r"[^\w\s]", " ", str(value).upper())
@@ -542,7 +548,7 @@ def _normalize_outcome(value: Optional[str]) -> Optional[str]:
         return None
     if text in {"TIE", "DRAW"}:
         return "DRAW"
-    return canonicalize_team(text)
+    return canonicalize_team(text, league_hint)
 
 
 def _to_utc_date(value: Optional[str]) -> Optional[str]:

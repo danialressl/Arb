@@ -9,7 +9,7 @@ import requests
 
 from arbv2.config import Config
 from arbv2.models import Market
-from arbv2.teams import canonicalize_team
+from arbv2.teams import canonicalize_team, league_hint_from_text, league_hint_from_url
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +35,9 @@ def ingest_polymarket(config: Config) -> List[Market]:
                 continue
             market_type = "sports_moneyline"
             event_date = _polymarket_event_date(market)
+            league_hint = _polymarket_league_hint(market)
             outcomes = _parse_json_list(market.get("outcomes"))
-            exploded = _explode_outcomes(market_id, outcomes)
+            exploded = _explode_outcomes(market_id, outcomes, league_hint)
             if exploded:
                 for exploded_id, outcome_label in exploded:
                     markets.append(
@@ -54,7 +55,7 @@ def ingest_polymarket(config: Config) -> List[Market]:
                         )
                     )
                 continue
-            outcome_label = _polymarket_outcome_label(market)
+            outcome_label = _polymarket_outcome_label(market, league_hint)
             markets.append(
                 Market(
                     venue="polymarket",
@@ -139,9 +140,13 @@ def _fetch_events(config: Config) -> List[Dict[str, object]]:
     return events if config.ingest_limit <= 0 else events[: config.ingest_limit]
 
 
+
+
 def _series_ids(config: Config) -> List[str]:
+    overrides = _series_id_overrides(config)
     if config.polymarket_series_ids.strip():
-        return [item.strip() for item in config.polymarket_series_ids.split(",") if item.strip()]
+        series_ids = [item.strip() for item in config.polymarket_series_ids.split(",") if item.strip()]
+        return _apply_series_id_overrides(series_ids, overrides)
     data = _get_json(config, "/sports")
     series_ids: List[str] = []
     if isinstance(data, list):
@@ -151,7 +156,35 @@ def _series_ids(config: Config) -> List[str]:
             series_id = item.get("series")
             if series_id:
                 series_ids.append(str(series_id))
-    return series_ids
+    return _apply_series_id_overrides(series_ids, overrides)
+
+
+def _series_id_overrides(config: Config) -> Dict[str, str]:
+    raw = config.polymarket_series_id_overrides.strip()
+    if not raw:
+        return {}
+    overrides: Dict[str, str] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if "=" not in entry:
+            logger.warning("Polymarket series override missing '=': %s", entry)
+            continue
+        source, target = entry.split("=", 1)
+        source = source.strip()
+        target = target.strip()
+        if not source or not target:
+            logger.warning("Polymarket series override invalid: %s", entry)
+            continue
+        overrides[source] = target
+    return overrides
+
+
+def _apply_series_id_overrides(series_ids: List[str], overrides: Dict[str, str]) -> List[str]:
+    if not overrides:
+        return series_ids
+    return [overrides.get(series_id, series_id) for series_id in series_ids]
 
 
 def _is_moneyline_market(market: Dict[str, object]) -> bool:
@@ -222,7 +255,7 @@ def _polymarket_event_date(market: Dict[str, object]) -> Optional[str]:
     return _to_utc_date(value)
 
 
-def _polymarket_outcome_label(market: Dict[str, object]) -> Optional[str]:
+def _polymarket_outcome_label(market: Dict[str, object], league_hint: Optional[str]) -> Optional[str]:
     question = str(market.get("question") or market.get("title") or "")
     group_title = str(market.get("groupItemTitle") or "")
     if "draw" in question.lower() or "draw" in group_title.lower():
@@ -231,11 +264,11 @@ def _polymarket_outcome_label(market: Dict[str, object]) -> Optional[str]:
         return "DRAW"
     match = re.search(r"will\s+(.+?)\s+win", question, re.IGNORECASE)
     if match:
-        return _normalize_outcome(match.group(1))
+        return _normalize_outcome(match.group(1), league_hint)
     return None
 
 
-def _normalize_outcome(value: Optional[str]) -> Optional[str]:
+def _normalize_outcome(value: Optional[str], league_hint: Optional[str]) -> Optional[str]:
     if not value:
         return None
     text = re.sub(r"[^\w\s]", " ", str(value).upper())
@@ -244,10 +277,10 @@ def _normalize_outcome(value: Optional[str]) -> Optional[str]:
         return None
     if text in {"TIE", "DRAW"}:
         return "DRAW"
-    return canonicalize_team(text)
+    return canonicalize_team(text, league_hint)
 
 
-def _explode_outcomes(base_id: str, outcomes: List[str]) -> List[tuple]:
+def _explode_outcomes(base_id: str, outcomes: List[str], league_hint: Optional[str]) -> List[tuple]:
     if not outcomes:
         return []
     normalized = [str(outcome).strip() for outcome in outcomes if str(outcome).strip()]
@@ -258,12 +291,24 @@ def _explode_outcomes(base_id: str, outcomes: List[str]) -> List[tuple]:
         return []
     exploded = []
     for outcome in normalized:
-        label = _normalize_outcome(outcome)
+        label = _normalize_outcome(outcome, league_hint)
         if not label:
             continue
         slug = re.sub(r"\s+", "_", label)
         exploded.append((f"{base_id}:{slug}", label))
     return exploded
+
+
+def _polymarket_league_hint(market: Dict[str, object]) -> Optional[str]:
+    resolution_source = market.get("resolutionSource")
+    hint = league_hint_from_url(resolution_source)
+    if hint:
+        return hint
+    description = str(market.get("description") or "")
+    title = str(market.get("question") or market.get("title") or "")
+    event_title = str(market.get("event_title") or "")
+    text = " ".join([description, title, event_title]).strip()
+    return league_hint_from_text(text)
 
 
 def _to_utc_date(value: Optional[str]) -> Optional[str]:

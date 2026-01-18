@@ -10,7 +10,7 @@ from arbv2.config import Config
 from arbv2.models import Market, PriceSnapshot
 from arbv2.pricing.arb import update_orderbook
 from arbv2.storage import insert_prices
-from arbv2.teams import canonicalize_team
+from arbv2.teams import canonicalize_team, league_hint_from_text, league_hint_from_url
 
 
 logger = logging.getLogger(__name__)
@@ -126,7 +126,7 @@ async def stream_books(config: Config, token_map: Dict[str, List[Tuple[Market, s
                     async for message in ws:
                         message_count += 1
                         if message_count % 100 == 0:
-                            logger.info("Polymarket WS messages=%d", message_count)
+                            logger.debug("Polymarket WS messages=%d", message_count)
                         snapshots = _handle_message(message, token_map, orderbooks, last_trade)
                         if snapshots:
                             insert_prices(db_path, snapshots)
@@ -345,6 +345,7 @@ async def _ping(ws) -> None:
 
 def _resolve_token_ids(market: Market) -> List[tuple]:
     raw = market.raw_json or {}
+    league_hint = _polymarket_league_hint(raw, market)
     outcomes = _parse_json_list(raw.get("outcomes"))
     tokens = _parse_json_list(raw.get("clobTokenIds"))
     if not outcomes or not tokens or len(outcomes) != len(tokens):
@@ -360,18 +361,18 @@ def _resolve_token_ids(market: Market) -> List[tuple]:
         if no_idx is not None:
             entries.append((tokens[no_idx], "NO"))
         return entries
-    target = _normalize_outcome_label(market.outcome_label)
+    target = _normalize_outcome_label(market.outcome_label, league_hint)
     if not target:
         return []
     for idx, outcome in enumerate(outcomes):
-        if _normalize_outcome_label(outcome) == target:
+        if _normalize_outcome_label(outcome, league_hint) == target:
             return [(tokens[idx], target)]
     return []
 
 
 def _find_outcome_index(outcomes: List[str], target: str) -> Optional[int]:
     for idx, outcome in enumerate(outcomes):
-        if _normalize_outcome_label(outcome) == target:
+        if _normalize_outcome_label(outcome, None) == target:
             return idx
     return None
 
@@ -394,7 +395,7 @@ def _is_yes_no(outcomes: List[str]) -> bool:
     return lowered.issubset({"yes", "no"})
 
 
-def _normalize_outcome_label(value: Optional[str]) -> Optional[str]:
+def _normalize_outcome_label(value: Optional[str], league_hint: Optional[str]) -> Optional[str]:
     if not value:
         return None
     text = re.sub(r"[^\w\s]", " ", str(value).upper())
@@ -403,7 +404,16 @@ def _normalize_outcome_label(value: Optional[str]) -> Optional[str]:
         return None
     if text in {"TIE", "DRAW"}:
         return "DRAW"
-    return canonicalize_team(text)
+    return canonicalize_team(text, league_hint)
+
+
+def _polymarket_league_hint(raw: Dict[str, object], market: Market) -> Optional[str]:
+    hint = league_hint_from_url(raw.get("resolutionSource"))
+    if hint:
+        return hint
+    description = str(raw.get("description") or "")
+    text = " ".join([description, market.title or "", market.event_title or ""]).strip()
+    return league_hint_from_text(text)
 
 
 def _parse_float(value: object) -> Optional[float]:

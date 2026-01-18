@@ -1,4 +1,6 @@
+import logging
 import os
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -7,17 +9,25 @@ from typing import Dict, List, Optional, Tuple
 
 ORDERBOOKS: Dict[Tuple[str, str, str], Dict[str, object]] = {}
 
+logger = logging.getLogger(__name__)
+
 KALSHI_FEE_BPS = float(os.getenv("ARBV2_KALSHI_FEE_BPS", "100"))
 POLY_FEE_BPS = float(os.getenv("ARBV2_POLY_FEE_BPS", "0"))
 SLIPPAGE_BPS = float(os.getenv("ARBV2_ARB_SLIPPAGE_BPS", "10"))
 MAX_STALENESS_SECONDS = float(os.getenv("ARBV2_ARB_MAX_STALENESS_SECONDS", "3"))
 MAX_SYNC_SKEW_SECONDS = float(os.getenv("ARBV2_ARB_MAX_SYNC_SKEW_SECONDS", "2"))
+POLY_MAX_AGE_SECONDS = 1.5
+KALSHI_MAX_AGE_SECONDS = 5.0
 EVENT_MIN_ROI = float(os.getenv("ARBV2_ARB_EVENT_MIN_ROI", "0.008"))
 EVENT_MIN_ABS_PROFIT = float(os.getenv("ARBV2_ARB_EVENT_MIN_ABS_PROFIT", "1.0"))
 BINARY_MIN_ROI = float(os.getenv("ARBV2_ARB_BINARY_MIN_ROI", "0.008"))
 BINARY_MIN_ABS_PROFIT = float(os.getenv("ARBV2_ARB_BINARY_MIN_ABS_PROFIT", "1.0"))
 Q_MIN = float(os.getenv("ARBV2_ARB_Q_MIN", "100"))
 Q_MAX = float(os.getenv("ARBV2_ARB_Q_MAX", "5000"))
+COOLDOWN_SECONDS = float(os.getenv("ARBV2_ARB_COOLDOWN_SECONDS", "45"))
+HYSTERESIS_BPS = float(os.getenv("ARBV2_ARB_HYSTERESIS_BPS", "200"))
+EVENT_LOCK_SECONDS = float(os.getenv("ARBV2_ARB_EVENT_LOCK_SECONDS", "20"))
+EVENT_LOCK_IMPROVEMENT_BPS = float(os.getenv("ARBV2_ARB_EVENT_LOCK_IMPROVEMENT_BPS", "300"))
 
 
 class ArbMode(str, Enum):
@@ -31,6 +41,68 @@ class EventMarkets:
     polymarket_by_outcome: Dict[str, str]
     outcomes: List[str]
     event_id: Optional[str] = None
+    outcome_id: Optional[str] = None
+
+
+class SignalSuppressor:
+    def __init__(
+        self,
+        *,
+        cooldown_seconds: float = COOLDOWN_SECONDS,
+        hysteresis_bps: float = HYSTERESIS_BPS,
+        event_lock_seconds: float = EVENT_LOCK_SECONDS,
+        improvement_bps: float = EVENT_LOCK_IMPROVEMENT_BPS,
+    ) -> None:
+        self.cooldown_seconds = cooldown_seconds
+        self.hysteresis_bps = hysteresis_bps
+        self.event_lock_seconds = event_lock_seconds
+        self.improvement_bps = improvement_bps
+        self.last_emit: Dict[Tuple[object, ...], Dict[str, float]] = {}
+        self.event_lock: Dict[Tuple[str, str], Dict[str, object]] = {}
+
+    def should_emit(
+        self,
+        *,
+        arb_type: ArbMode,
+        key: Tuple[object, ...],
+        event_key: Optional[str],
+        edge_bps: float,
+        size: float,
+        now_ts: float,
+    ) -> Tuple[bool, str]:
+        # Direction is excluded so any EVENT_OUTCOME for the event shares the same lock.
+        lock_key = (event_key or "UNKNOWN", arb_type.value)
+        lock = self.event_lock.get(lock_key)
+        if lock:
+            age = now_ts - float(lock["ts"])
+            if age < self.event_lock_seconds:
+                if key != lock["best_key"] and edge_bps < float(lock["best_edge_bps"]) + self.improvement_bps:
+                    return False, "event_lock"
+
+        last = self.last_emit.get(key)
+        if last:
+            age = now_ts - float(last["ts"])
+            if age < self.cooldown_seconds:
+                last_edge = float(last["edge_bps"])
+                last_size = float(last.get("size", 0.0))
+                improvement = edge_bps - last_edge
+                if edge_bps < last_edge + self.hysteresis_bps:
+                    return False, "cooldown"
+                if size < last_size and improvement < self.hysteresis_bps:
+                    return False, "cooldown"
+
+        self.last_emit[key] = {"ts": now_ts, "edge_bps": edge_bps, "size": size}
+        if event_key:
+            if not lock or edge_bps >= float(lock["best_edge_bps"]):
+                self.event_lock[lock_key] = {
+                    "ts": now_ts,
+                    "best_key": key,
+                    "best_edge_bps": edge_bps,
+                }
+        return True, ""
+
+
+SIGNAL_SUPPRESSOR = SignalSuppressor()
 
 
 def update_orderbook(
@@ -46,6 +118,7 @@ def update_orderbook(
         "bids": sorted(bids, key=lambda x: x[0], reverse=True),
         "asks": sorted(asks, key=lambda x: x[0]),
         "last_update_ts_utc": _ensure_utc(last_update_ts_utc),
+        "fetched_at_ts": time.time(),
     }
 
 
@@ -251,6 +324,14 @@ def _profit_signal(
 def _evaluate_event_outcome(event: EventMarkets, Q: float, now_utc: datetime) -> Optional[Dict[str, object]]:
     if len(event.outcomes) != 2:
         return None
+    keys = [
+        ("kalshi", event.kalshi_by_outcome.get(event.outcomes[0]), event.outcomes[0]),
+        ("kalshi", event.kalshi_by_outcome.get(event.outcomes[1]), event.outcomes[1]),
+        ("polymarket", event.polymarket_by_outcome.get(event.outcomes[0]), event.outcomes[0]),
+        ("polymarket", event.polymarket_by_outcome.get(event.outcomes[1]), event.outcomes[1]),
+    ]
+    if not _books_fresh_by_venue(keys):
+        return None
     outcome_a, outcome_b = event.outcomes
     if not _books_fresh(
         [
@@ -365,6 +446,14 @@ def _evaluate_event_outcome(event: EventMarkets, Q: float, now_utc: datetime) ->
 
 def _evaluate_binary_mirror(event: EventMarkets, Q: float, now_utc: datetime) -> Optional[Dict[str, object]]:
     if len(event.outcomes) != 2:
+        return None
+    keys = [
+        ("kalshi", event.kalshi_by_outcome.get("YES"), "YES"),
+        ("kalshi", event.kalshi_by_outcome.get("NO"), "NO"),
+        ("polymarket", event.polymarket_by_outcome.get("YES"), "YES"),
+        ("polymarket", event.polymarket_by_outcome.get("NO"), "NO"),
+    ]
+    if not _books_fresh_by_venue(keys):
         return None
     if not _books_fresh(
         [
@@ -495,6 +584,14 @@ def _profit_event_outcome_rows(event: EventMarkets, Q: float, now_utc: datetime)
     if len(event.outcomes) != 2:
         return []
     outcome_a, outcome_b = event.outcomes
+    keys = [
+        ("kalshi", event.kalshi_by_outcome.get(outcome_a), outcome_a),
+        ("kalshi", event.kalshi_by_outcome.get(outcome_b), outcome_b),
+        ("polymarket", event.polymarket_by_outcome.get(outcome_a), outcome_a),
+        ("polymarket", event.polymarket_by_outcome.get(outcome_b), outcome_b),
+    ]
+    if not _books_fresh_by_venue(keys):
+        return []
     if not _books_fresh(
         [
             ("kalshi", event.kalshi_by_outcome.get(outcome_a), outcome_a),
@@ -548,6 +645,14 @@ def _profit_event_outcome_rows(event: EventMarkets, Q: float, now_utc: datetime)
 
 def _profit_binary_mirror_rows(event: EventMarkets, Q: float, now_utc: datetime) -> List[Dict[str, object]]:
     if len(event.outcomes) != 2:
+        return []
+    keys = [
+        ("kalshi", event.kalshi_by_outcome.get("YES"), "YES"),
+        ("kalshi", event.kalshi_by_outcome.get("NO"), "NO"),
+        ("polymarket", event.polymarket_by_outcome.get("YES"), "YES"),
+        ("polymarket", event.polymarket_by_outcome.get("NO"), "NO"),
+    ]
+    if not _books_fresh_by_venue(keys):
         return []
     if not _books_fresh(
         [
@@ -624,6 +729,27 @@ def _books_fresh(keys: List[Tuple[str, Optional[str], str]], now_utc: datetime) 
     return True
 
 
+def _books_fresh_by_venue(keys: List[Tuple[str, Optional[str], str]]) -> bool:
+    now_ts = time.time()
+    for venue, market_id, outcome in keys:
+        if not market_id:
+            return False
+        book = ORDERBOOKS.get((venue, market_id, outcome))
+        if not book:
+            return False
+        fetched_at = book.get("fetched_at_ts")
+        if not isinstance(fetched_at, (int, float)):
+            return False
+        age_seconds = now_ts - float(fetched_at)
+        if venue == "polymarket":
+            if age_seconds > POLY_MAX_AGE_SECONDS:
+                return False
+        elif venue == "kalshi":
+            if age_seconds > KALSHI_MAX_AGE_SECONDS:
+                return False
+    return True
+
+
 def _ensure_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
@@ -634,3 +760,66 @@ def _thresholds(arb_type: ArbMode) -> Tuple[float, float]:
     if arb_type == ArbMode.BINARY_MIRROR:
         return BINARY_MIN_ROI, BINARY_MIN_ABS_PROFIT
     return EVENT_MIN_ROI, EVENT_MIN_ABS_PROFIT
+
+
+def signal_edge_bps(signal: Dict[str, object]) -> float:
+    size = float(signal.get("size") or 0.0)
+    profit = float(signal.get("profit") or 0.0)
+    if size <= 0:
+        return 0.0
+    return (profit / size) * 10_000
+
+
+def signal_fingerprint(
+    event: EventMarkets,
+    arb_type: ArbMode,
+    signal: Dict[str, object],
+) -> Tuple[Tuple[object, ...], str]:
+    event_key = event.event_id or "|".join(event.outcomes) if event.outcomes else "UNKNOWN"
+    direction_raw = str(signal.get("direction") or "")
+    if arb_type == ArbMode.EVENT_OUTCOME:
+        direction = direction_raw.replace(" ", "").upper()
+        outcomes = event.outcomes if len(event.outcomes) == 2 else ["UNKNOWN", "UNKNOWN"]
+        outcome_by_letter = {"A": outcomes[0], "B": outcomes[1]}
+        venue_to_letter: Dict[str, str] = {}
+        for part in direction.split("+"):
+            if ":" not in part:
+                continue
+            venue_token, letter = part.split(":", 1)
+            if letter not in {"A", "B"}:
+                continue
+            if venue_token in {"KALSHI", "KAL"}:
+                venue_to_letter["kalshi"] = letter
+            elif venue_token in {"POLY", "POLYMARKET"}:
+                venue_to_letter["polymarket"] = letter
+        venue_pair = ("kalshi", "polymarket")
+        if venue_to_letter.get("kalshi") and venue_to_letter.get("polymarket"):
+            outcome_pair = (
+                outcome_by_letter.get(venue_to_letter["kalshi"], outcomes[0]),
+                outcome_by_letter.get(venue_to_letter["polymarket"], outcomes[1]),
+            )
+        else:
+            outcome_pair = (outcomes[0], outcomes[1])
+        key = (arb_type.value, event_key, venue_pair, outcome_pair, direction)
+        return key, event_key
+    outcome_id = event.outcome_id or "UNKNOWN"
+    key = (arb_type.value, event_key, outcome_id, direction_raw)
+    return key, event_key
+
+
+def should_emit_signal(event: EventMarkets, arb_type: ArbMode, signal: Dict[str, object]) -> bool:
+    key, event_key = signal_fingerprint(event, arb_type, signal)
+    edge_bps = signal_edge_bps(signal)
+    size = float(signal.get("size") or 0.0)
+    now_ts = time.time()
+    allowed, reason = SIGNAL_SUPPRESSOR.should_emit(
+        arb_type=arb_type,
+        key=key,
+        event_key=event_key,
+        edge_bps=edge_bps,
+        size=size,
+        now_ts=now_ts,
+    )
+    if not allowed:
+        logger.debug("arb suppressed: %s key=%s edge_bps=%.2f", reason, key, edge_bps)
+    return allowed
