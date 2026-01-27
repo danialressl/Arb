@@ -24,9 +24,12 @@ from arbv2.pricing.polymarket import (
 from arbv2.pricing.kalshi import poll_markets
 from arbv2.pricing.arb import (
     ArbMode,
+    CONFIRM_MODE,
     EventMarkets,
     ORDERBOOKS,
     Q_MIN,
+    confirm_on_trigger,
+    post_confirm_decision,
     evaluate_profit_at_size,
     evaluate_profit_rows,
     find_best_arb,
@@ -471,6 +474,48 @@ def _scan_arb_events(db_path: str, events: List[EventMarkets], mode: ArbMode) ->
             continue
         if not should_emit_signal(event, mode, signal):
             continue
+        detected_ts = int(time.time() * 1000)
+        signal["detected_ts"] = detected_ts
+        logger.info(
+            "ARB detected ts=%d event_id=%s arb_type=%s direction=%s",
+            detected_ts,
+            signal.get("event_id"),
+            signal.get("arb_type"),
+            signal.get("direction"),
+        )
+        if CONFIRM_MODE == "on_trigger":
+            decision = confirm_on_trigger(signal)
+            logger.info(
+                "ARB confirm %s reason=%s edge_bps=%.2f expected_pnl=%.4f",
+                "PASS" if decision["ok"] else "FAIL",
+                decision.get("reason") or "",
+                decision.get("recalculated_edge_bps") or 0.0,
+                decision.get("expected_pnl_usd") or 0.0,
+            )
+            if not decision["ok"]:
+                _append_confirm_rejection_csv(
+                    signal,
+                    decision,
+                    None,
+                    "confirm_on_trigger",
+                    "arbv2_confirm_rejections.csv",
+                )
+                continue
+            post_decision = post_confirm_decision(event, mode, signal, decision)
+            if not post_decision["ok"]:
+                _append_confirm_rejection_csv(
+                    signal,
+                    decision,
+                    post_decision,
+                    "post_confirm",
+                    "arbv2_confirm_rejections.csv",
+                )
+                continue
+            intent = _build_execution_intent(signal, decision)
+            logger.info("EXECUTION_INTENT %s", json.dumps(intent, separators=(",", ":")))
+            _append_execution_intent_csv(intent, "arbv2_execution_intents.csv")
+            _log_signal_details(signal)
+            continue
         _append_arb_csv(signal, "arbv2_arbs.csv")
         logger.info(
             "ARB signal %s size=%s profit=%.2f roi=%.4f direction=%s",
@@ -480,25 +525,128 @@ def _scan_arb_events(db_path: str, events: List[EventMarkets], mode: ArbMode) ->
             signal["roi"],
             signal["direction"],
         )
-        for leg in signal["legs"]:
-            venue = leg["venue"]
-            market_id = leg["market_id"]
-            outcome_label = leg["outcome_label"]
-            book = _format_book_snapshot(venue, market_id, outcome_label)
-            logger.info(
-                "  leg %s %s %s vwap=%.4f eff=%.4f worst=%.4f book=%s",
-                venue,
-                market_id,
-                outcome_label,
-                leg["raw_vwap"] or 0.0,
-                leg["eff_vwap"] or 0.0,
-                leg["worst_price"] or 0.0,
-                book,
-            )
+        _log_signal_details(signal)
     scan_rows = list(best_by_key.values())
     if scan_rows:
         insert_arb_scans(db_path, scan_rows)
     return None
+
+
+def _log_signal_details(signal: Dict[str, object]) -> None:
+    for leg in signal.get("legs") or []:
+        venue = leg["venue"]
+        market_id = leg["market_id"]
+        outcome_label = leg["outcome_label"]
+        book = _format_book_snapshot(venue, market_id, outcome_label)
+        logger.info(
+            "  leg %s %s %s vwap=%.4f eff=%.4f worst=%.4f book=%s",
+            venue,
+            market_id,
+            outcome_label,
+            leg["raw_vwap"] or 0.0,
+            leg["eff_vwap"] or 0.0,
+            leg["worst_price"] or 0.0,
+            book,
+        )
+
+
+def _build_execution_intent(signal: Dict[str, object], decision: Dict[str, object]) -> Dict[str, object]:
+    legs = signal.get("legs") or []
+    return {
+        "type": "EXECUTION_INTENT",
+        "event_id": signal.get("event_id"),
+        "venues": [leg.get("venue") for leg in legs],
+        "markets": [leg.get("market_id") for leg in legs],
+        "sides": [leg.get("side") for leg in legs],
+        "limit_prices": decision.get("limit_prices") or [leg.get("eff_vwap") for leg in legs],
+        "size_usd": signal.get("size"),
+        "edge_bps": decision.get("recalculated_edge_bps"),
+        "expected_pnl_usd": decision.get("expected_pnl_usd"),
+        "confirmed_at_ts": int(time.time() * 1000),
+    }
+
+
+def _append_execution_intent_csv(intent: Dict[str, object], csv_path: str) -> None:
+    row = {
+        "type": intent.get("type"),
+        "event_id": intent.get("event_id"),
+        "venues": json.dumps(intent.get("venues") or [], separators=(",", ":")),
+        "markets": json.dumps(intent.get("markets") or [], separators=(",", ":")),
+        "sides": json.dumps(intent.get("sides") or [], separators=(",", ":")),
+        "limit_prices": json.dumps(intent.get("limit_prices") or [], separators=(",", ":")),
+        "size_usd": intent.get("size_usd"),
+        "edge_bps": intent.get("edge_bps"),
+        "expected_pnl_usd": intent.get("expected_pnl_usd"),
+        "confirmed_at_ts": intent.get("confirmed_at_ts"),
+    }
+    write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _append_confirm_rejection_csv(
+    signal: Dict[str, object],
+    decision: Dict[str, object],
+    post_decision: Optional[Dict[str, object]],
+    stage: str,
+    csv_path: str,
+) -> None:
+    legs = signal.get("legs") or []
+    raw_vwap_map = _legs_to_map(legs, "raw_vwap")
+    eff_vwap_map = _legs_to_map(legs, "eff_vwap")
+    limit_prices = decision.get("limit_prices") or []
+    limit_price_map = _legs_to_map(legs, "eff_vwap", override_values=limit_prices)
+    row = {
+        "event_id": signal.get("event_id"),
+        "arb_type": signal.get("arb_type"),
+        "direction": signal.get("direction"),
+        "size_usd": signal.get("size"),
+        "detected_ts": signal.get("detected_ts"),
+        "stage": stage,
+        "reason": decision.get("reason"),
+        "edge_bps": decision.get("recalculated_edge_bps"),
+        "expected_pnl_usd": decision.get("expected_pnl_usd"),
+        "raw_vwaps_by_venue": json.dumps(raw_vwap_map, separators=(",", ":")),
+        "eff_vwaps_by_venue": json.dumps(eff_vwap_map, separators=(",", ":")),
+        "confirm_limit_prices_by_venue": json.dumps(limit_price_map, separators=(",", ":")),
+        "first_confirm_edge_bps": post_decision.get("prev_edge_bps") if post_decision else None,
+        "second_confirm_edge_bps": post_decision.get("edge_bps") if post_decision else None,
+        "confirm_age_ms": post_decision.get("age_ms") if post_decision else None,
+        "edge_decay_bps": post_decision.get("edge_decay_bps") if post_decision else None,
+        "post_confirm_reason": post_decision.get("reason") if post_decision else None,
+        "venues": json.dumps([leg.get("venue") for leg in legs], separators=(",", ":")),
+        "markets": json.dumps([leg.get("market_id") for leg in legs], separators=(",", ":")),
+        "sides": json.dumps([leg.get("side") for leg in legs], separators=(",", ":")),
+    }
+    write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def _legs_to_map(legs: List[Dict[str, object]], key: str, *, override_values: Optional[List[object]] = None) -> Dict[str, object]:
+    output: Dict[str, object] = {}
+    for idx, leg in enumerate(legs):
+        venue = str(leg.get("venue") or "")
+        if not venue:
+            continue
+        value = leg.get(key)
+        if override_values is not None and idx < len(override_values):
+            value = override_values[idx]
+        if venue not in output:
+            output[venue] = value
+        else:
+            existing = output[venue]
+            if isinstance(existing, list):
+                existing.append(value)
+            else:
+                output[venue] = [existing, value]
+    return output
 
 
 def _format_book_snapshot(venue: str, market_id: str, outcome_label: str) -> str:

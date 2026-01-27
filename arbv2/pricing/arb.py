@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 import time
@@ -28,6 +29,15 @@ COOLDOWN_SECONDS = float(os.getenv("ARBV2_ARB_COOLDOWN_SECONDS", "45"))
 HYSTERESIS_BPS = float(os.getenv("ARBV2_ARB_HYSTERESIS_BPS", "200"))
 EVENT_LOCK_SECONDS = float(os.getenv("ARBV2_ARB_EVENT_LOCK_SECONDS", "20"))
 EVENT_LOCK_IMPROVEMENT_BPS = float(os.getenv("ARBV2_ARB_EVENT_LOCK_IMPROVEMENT_BPS", "300"))
+CONFIRM_MODE = os.getenv("ARBV2_CONFIRM_MODE", "on_trigger")
+TRIGGER_CONFIRM_TTL_MS = int(os.getenv("ARBV2_TRIGGER_CONFIRM_TTL_MS", "2500"))
+MAX_SLIPPAGE_BPS = int(os.getenv("ARBV2_MAX_SLIPPAGE_BPS", "20"))
+MIN_EDGE_BPS = int(os.getenv("ARBV2_MIN_EDGE_BPS", "40"))
+RECENT_FIRE_TTL_MS = int(os.getenv("ARBV2_RECENT_FIRE_TTL_MS", "5000"))
+IDEMPOTENCY_BUCKET_MS = int(os.getenv("ARBV2_IDEMPOTENCY_BUCKET_MS", "2000"))
+POST_CONFIRM_ENABLED = os.getenv("ARBV2_POST_CONFIRM_ENABLED", "true") == "true"
+POST_CONFIRM_WINDOW_MS = int(os.getenv("ARBV2_POST_CONFIRM_WINDOW_MS", "400"))
+POST_CONFIRM_MAX_EDGE_DECAY_BPS = int(os.getenv("ARBV2_POST_CONFIRM_MAX_EDGE_DECAY_BPS", "30"))
 
 
 class ArbMode(str, Enum):
@@ -103,6 +113,8 @@ class SignalSuppressor:
 
 
 SIGNAL_SUPPRESSOR = SignalSuppressor()
+CONFIRM_IDEMPOTENCY: Dict[str, int] = {}
+POST_CONFIRM_CACHE: Dict[str, Dict[str, float]] = {}
 
 
 def update_orderbook(
@@ -823,3 +835,171 @@ def should_emit_signal(event: EventMarkets, arb_type: ArbMode, signal: Dict[str,
     if not allowed:
         logger.debug("arb suppressed: %s key=%s edge_bps=%.2f", reason, key, edge_bps)
     return allowed
+
+
+def post_confirm_decision(
+    event: EventMarkets,
+    arb_type: ArbMode,
+    signal: Dict[str, object],
+    decision: Dict[str, object],
+    *,
+    now_ms: Optional[int] = None,
+) -> Dict[str, object]:
+    if not POST_CONFIRM_ENABLED:
+        return {"ok": True, "reason": "disabled"}
+    key = _post_confirm_fingerprint(event, arb_type, signal)
+    if now_ms is None:
+        now_ms = int(time.time() * 1000)
+    prev = POST_CONFIRM_CACHE.get(key)
+    edge_bps = float(decision.get("recalculated_edge_bps") or 0.0)
+    if not prev:
+        POST_CONFIRM_CACHE[key] = {
+            "ts": float(now_ms),
+            "edge_bps": edge_bps,
+        }
+        logger.debug("post-confirm cached key=%s edge_bps=%.2f", key, edge_bps)
+        return {
+            "ok": False,
+            "reason": "first_confirm_cached",
+            "edge_bps": edge_bps,
+        }
+    age_ms = now_ms - int(prev["ts"])
+    if age_ms > POST_CONFIRM_WINDOW_MS:
+        POST_CONFIRM_CACHE[key] = {
+            "ts": float(now_ms),
+            "edge_bps": edge_bps,
+        }
+        logger.debug("post-confirm reset key=%s age_ms=%d", key, age_ms)
+        return {
+            "ok": False,
+            "reason": "window_expired",
+            "edge_bps": edge_bps,
+            "prev_edge_bps": float(prev["edge_bps"]),
+            "age_ms": age_ms,
+        }
+    edge_decay = float(prev["edge_bps"]) - edge_bps
+    if edge_decay > POST_CONFIRM_MAX_EDGE_DECAY_BPS:
+        POST_CONFIRM_CACHE.pop(key, None)
+        logger.debug("post-confirm reject key=%s edge_decay=%.2f", key, edge_decay)
+        return {
+            "ok": False,
+            "reason": "edge_decay",
+            "edge_bps": edge_bps,
+            "prev_edge_bps": float(prev["edge_bps"]),
+            "edge_decay_bps": edge_decay,
+            "age_ms": age_ms,
+        }
+    POST_CONFIRM_CACHE.pop(key, None)
+    logger.debug("post-confirm accept key=%s age_ms=%d", key, age_ms)
+    return {
+        "ok": True,
+        "reason": "second_confirm",
+        "edge_bps": edge_bps,
+        "prev_edge_bps": float(prev["edge_bps"]),
+        "edge_decay_bps": edge_decay,
+        "age_ms": age_ms,
+    }
+
+
+def confirm_on_trigger(opportunity: Dict[str, object]) -> Dict[str, object]:
+    detected_ts = opportunity.get("detected_ts")
+    if detected_ts is None:
+        return _confirm_result(False, "missing_detected_ts", 0.0, 0.0)
+    try:
+        detected_ts_ms = int(detected_ts)
+    except (TypeError, ValueError):
+        return _confirm_result(False, "invalid_detected_ts", 0.0, 0.0)
+    now_ms = int(time.time() * 1000)
+    if now_ms - detected_ts_ms > TRIGGER_CONFIRM_TTL_MS:
+        return _confirm_result(False, "ttl_expired", 0.0, 0.0)
+
+    legs = opportunity.get("legs") or []
+    keys: List[Tuple[str, Optional[str], str]] = []
+    for leg in legs:
+        venue = str(leg.get("venue") or "")
+        market_id = str(leg.get("market_id") or "")
+        outcome_label = str(leg.get("outcome_label") or "")
+        if not venue or not market_id or not outcome_label:
+            return _confirm_result(False, "missing_book", 0.0, 0.0)
+        keys.append((venue, market_id, outcome_label))
+        if (venue, market_id, outcome_label) not in ORDERBOOKS:
+            return _confirm_result(False, "missing_book", 0.0, 0.0)
+    if not _books_fresh_by_venue(keys):
+        return _confirm_result(False, "stale_book", 0.0, 0.0)
+
+    size = float(opportunity.get("size") or 0.0)
+    if size <= 0:
+        return _confirm_result(False, "invalid_size", 0.0, 0.0)
+
+    eff_prices: List[float] = []
+    for leg in legs:
+        venue = str(leg.get("venue"))
+        market_id = str(leg.get("market_id"))
+        outcome_label = str(leg.get("outcome_label"))
+        side = str(leg.get("side") or "YES")
+        stats = get_fill_stats(venue, market_id, outcome_label, side, size)
+        if not stats.get("ok"):
+            return _confirm_result(False, "insufficient_depth", 0.0, 0.0)
+        eff_price = apply_fees(venue, stats.get("vwap_price"), size)
+        if eff_price is None:
+            return _confirm_result(False, "missing_price", 0.0, 0.0)
+        eff_price *= 1 + (MAX_SLIPPAGE_BPS / 10_000)
+        eff_prices.append(eff_price)
+
+    total_price = sum(eff_prices)
+    total_cost = size * total_price
+    expected_pnl = (size * 1.0) - total_cost
+    if size <= 0:
+        edge_bps = 0.0
+    else:
+        edge_bps = (expected_pnl / size) * 10_000
+    if edge_bps < MIN_EDGE_BPS:
+        return _confirm_result(False, "edge_below_min", edge_bps, expected_pnl)
+    if expected_pnl <= 0:
+        return _confirm_result(False, "non_positive_pnl", edge_bps, expected_pnl)
+
+    bucket = detected_ts_ms // IDEMPOTENCY_BUCKET_MS
+    key = _confirm_idempotency_key(legs, eff_prices, bucket)
+    last_ts = CONFIRM_IDEMPOTENCY.get(key)
+    if last_ts is not None and (now_ms - last_ts) < RECENT_FIRE_TTL_MS:
+        return _confirm_result(False, "duplicate", edge_bps, expected_pnl)
+    CONFIRM_IDEMPOTENCY[key] = now_ms
+
+    return _confirm_result(True, "", edge_bps, expected_pnl, limit_prices=eff_prices)
+
+
+def _confirm_idempotency_key(legs: List[Dict[str, object]], eff_prices: List[float], bucket: int) -> str:
+    parts = []
+    for leg, eff_price in zip(legs, eff_prices):
+        venue = str(leg.get("venue") or "")
+        market_id = str(leg.get("market_id") or "")
+        side = str(leg.get("side") or "")
+        rounded = f"{float(eff_price):.4f}"
+        parts.append(f"{venue}:{market_id}:{side}:{rounded}")
+    raw = f"{bucket}|" + "|".join(parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _post_confirm_fingerprint(event: EventMarkets, arb_type: ArbMode, signal: Dict[str, object]) -> str:
+    key, _ = signal_fingerprint(event, arb_type, signal)
+    raw = repr(key)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _confirm_result(
+    ok: bool,
+    reason: str,
+    recalculated_edge_bps: float,
+    expected_pnl_usd: float,
+    *,
+    limit_prices: Optional[List[float]] = None,
+) -> Dict[str, object]:
+    result = {
+        "ok": ok,
+        "reason": reason,
+        "recalculated_edge_bps": float(recalculated_edge_bps),
+        "expected_pnl_usd": float(expected_pnl_usd),
+    }
+    if limit_prices is not None:
+        result["limit_prices"] = limit_prices
+    return result
