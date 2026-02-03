@@ -3,3 +3,4 @@ requests
 websockets
 pydantic
 PyYAML
+cryptography

@@ -21,7 +21,7 @@ from arbv2.pricing.polymarket import (
     stream_books as stream_poly_books,
     validate_clob_auth,
 )
-from arbv2.pricing.kalshi import poll_markets
+from arbv2.pricing.kalshi import stream_books as stream_kalshi_books
 from arbv2.pricing.arb import (
     ArbMode,
     CONFIRM_MODE,
@@ -230,18 +230,7 @@ def _run_price(config, args) -> int:
         except KeyboardInterrupt:
             logger.info("Price stream stopped")
     elif args.kalshi and kalshi_markets and args.snapshot:
-        try:
-            asyncio.run(
-                poll_markets(
-                    config,
-                    kalshi_markets,
-                    config.db_path,
-                    poll_seconds=args.poll_seconds,
-                    run_once=True,
-                )
-            )
-        except KeyboardInterrupt:
-            logger.info("Kalshi price stream stopped")
+        logger.warning("Kalshi snapshot via polling is disabled; use --stream instead.")
     return 0
 
 
@@ -331,17 +320,7 @@ async def _run_price_streams(
     if poly_token_map:
         tasks.append(asyncio.create_task(stream_poly_books(config, poly_token_map, config.db_path)))
     if kalshi_markets:
-        tasks.append(
-            asyncio.create_task(
-                poll_markets(
-                    config,
-                    kalshi_markets,
-                    config.db_path,
-                    poll_seconds=poll_seconds,
-                    run_once=False,
-                )
-            )
-        )
+        tasks.append(asyncio.create_task(stream_kalshi_books(config, kalshi_markets, config.db_path)))
     tasks.append(asyncio.create_task(_run_arb_stream(config)))
     if not tasks:
         return
@@ -428,17 +407,7 @@ async def _run_live_loop(
         if enable_polymarket and poly_token_map:
             tasks.append(asyncio.create_task(stream_poly_books(config, poly_token_map, config.db_path)))
         if enable_kalshi and kalshi_markets:
-            tasks.append(
-                asyncio.create_task(
-                    poll_markets(
-                        config,
-                        kalshi_markets,
-                        config.db_path,
-                        poll_seconds=poll_seconds,
-                        run_once=False,
-                    )
-                )
-            )
+            tasks.append(asyncio.create_task(stream_kalshi_books(config, kalshi_markets, config.db_path)))
         tasks.append(asyncio.create_task(_run_arb_stream(config)))
         if not tasks:
             logger.warning("No price streams to run; sleeping %d seconds", interval_seconds)
@@ -511,7 +480,7 @@ def _scan_arb_events(db_path: str, events: List[EventMarkets], mode: ArbMode) ->
                     "arbv2_confirm_rejections.csv",
                 )
                 continue
-            intent = _build_execution_intent(signal, decision)
+            intent = _build_execution_intent(signal, post_decision)
             logger.info("EXECUTION_INTENT %s", json.dumps(intent, separators=(",", ":")))
             _append_execution_intent_csv(intent, "arbv2_execution_intents.csv")
             _log_signal_details(signal)
@@ -560,7 +529,7 @@ def _build_execution_intent(signal: Dict[str, object], decision: Dict[str, objec
         "sides": [leg.get("side") for leg in legs],
         "limit_prices": decision.get("limit_prices") or [leg.get("eff_vwap") for leg in legs],
         "size_usd": signal.get("size"),
-        "edge_bps": decision.get("recalculated_edge_bps"),
+        "edge_bps": decision.get("recalculated_edge_bps") or decision.get("edge_bps"),
         "expected_pnl_usd": decision.get("expected_pnl_usd"),
         "confirmed_at_ts": int(time.time() * 1000),
     }
@@ -599,12 +568,30 @@ def _append_confirm_rejection_csv(
     eff_vwap_map = _legs_to_map(legs, "eff_vwap")
     limit_prices = decision.get("limit_prices") or []
     limit_price_map = _legs_to_map(legs, "eff_vwap", override_values=limit_prices)
+    detected_edge_bps = signal_edge_bps(signal)
+    confirmed_edge_bps = None
+    if post_decision:
+        confirmed_edge_bps = post_decision.get("edge_bps")
+    else:
+        confirmed_edge_bps = decision.get("recalculated_edge_bps")
+    detected_ts = signal.get("detected_ts")
+    confirm_latency_ms = None
+    try:
+        if detected_ts is not None:
+            confirm_latency_ms = int(time.time() * 1000) - int(detected_ts)
+    except (TypeError, ValueError):
+        confirm_latency_ms = None
+    rejection_reason = None
+    if post_decision:
+        rejection_reason = post_decision.get("reason")
+    else:
+        rejection_reason = decision.get("reason")
     row = {
         "event_id": signal.get("event_id"),
         "arb_type": signal.get("arb_type"),
         "direction": signal.get("direction"),
         "size_usd": signal.get("size"),
-        "detected_ts": signal.get("detected_ts"),
+        "detected_ts": detected_ts,
         "stage": stage,
         "reason": decision.get("reason"),
         "edge_bps": decision.get("recalculated_edge_bps"),
@@ -612,6 +599,10 @@ def _append_confirm_rejection_csv(
         "raw_vwaps_by_venue": json.dumps(raw_vwap_map, separators=(",", ":")),
         "eff_vwaps_by_venue": json.dumps(eff_vwap_map, separators=(",", ":")),
         "confirm_limit_prices_by_venue": json.dumps(limit_price_map, separators=(",", ":")),
+        "detected_edge_bps": detected_edge_bps,
+        "confirmed_edge_bps": confirmed_edge_bps,
+        "confirm_latency_ms": confirm_latency_ms,
+        "rejection_reason": rejection_reason,
         "first_confirm_edge_bps": post_decision.get("prev_edge_bps") if post_decision else None,
         "second_confirm_edge_bps": post_decision.get("edge_bps") if post_decision else None,
         "confirm_age_ms": post_decision.get("age_ms") if post_decision else None,
