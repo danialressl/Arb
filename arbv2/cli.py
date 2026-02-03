@@ -605,6 +605,7 @@ def _append_confirm_rejection_csv(
         rejection_reason = post_decision.get("reason")
     else:
         rejection_reason = decision.get("reason")
+    sync_skew_seconds = post_decision.get("sync_skew_seconds") if post_decision else None
     row = {
         "event_id": signal.get("event_id"),
         "arb_type": signal.get("arb_type"),
@@ -622,6 +623,7 @@ def _append_confirm_rejection_csv(
         "confirmed_edge_bps": confirmed_edge_bps,
         "confirm_latency_ms": confirm_latency_ms,
         "rejection_reason": rejection_reason,
+        "sync_skew_seconds": sync_skew_seconds,
         "first_confirm_edge_bps": post_decision.get("prev_edge_bps") if post_decision else None,
         "second_confirm_edge_bps": post_decision.get("edge_bps") if post_decision else None,
         "confirm_age_ms": post_decision.get("age_ms") if post_decision else None,
