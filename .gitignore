@@ -1,1 +1,10 @@
 kalshi_private_key.pem
+arbv2.db
+arbv2.db-journal
+arbv2_arbs.csv
+arbv2_execution_intents.csv
+arbv2_confirm_rejections.csv
+*.pem
+.venv/
+__pycache__/
+*.pyc
