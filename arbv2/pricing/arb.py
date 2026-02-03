@@ -16,10 +16,10 @@ logger = logging.getLogger(__name__)
 KALSHI_FEE_RATE = float(os.getenv("ARBV2_KALSHI_FEE_RATE", "0.07"))
 POLY_FEE_BPS = float(os.getenv("ARBV2_POLY_FEE_BPS", "0"))
 SLIPPAGE_BPS = float(os.getenv("ARBV2_ARB_SLIPPAGE_BPS", "10"))
-MAX_STALENESS_SECONDS = float(os.getenv("ARBV2_ARB_MAX_STALENESS_SECONDS", "3"))
-MAX_SYNC_SKEW_SECONDS = float(os.getenv("ARBV2_ARB_MAX_SYNC_SKEW_SECONDS", "2"))
-POLY_MAX_AGE_SECONDS = 1.5
-KALSHI_MAX_AGE_SECONDS = 5.0
+MAX_STALENESS_SECONDS = float(os.getenv("ARBV2_ARB_MAX_STALENESS_SECONDS", "0"))
+MAX_SYNC_SKEW_SECONDS = float(os.getenv("ARBV2_ARB_MAX_SYNC_SKEW_SECONDS", "0"))
+POLY_MAX_AGE_SECONDS = float(os.getenv("ARBV2_ARB_POLY_MAX_AGE_SECONDS", "0"))
+KALSHI_MAX_AGE_SECONDS = float(os.getenv("ARBV2_ARB_KALSHI_MAX_AGE_SECONDS", "0"))
 EVENT_MIN_ROI = float(os.getenv("ARBV2_ARB_EVENT_MIN_ROI", "0.008"))
 EVENT_MIN_ABS_PROFIT = float(os.getenv("ARBV2_ARB_EVENT_MIN_ABS_PROFIT", "1.0"))
 BINARY_MIN_ROI = float(os.getenv("ARBV2_ARB_BINARY_MIN_ROI", "0.008"))
@@ -769,10 +769,10 @@ def _books_fresh_by_venue(keys: List[Tuple[str, Optional[str], str]]) -> bool:
             return False
         age_seconds = now_ts - float(fetched_at)
         if venue == "polymarket":
-            if age_seconds > POLY_MAX_AGE_SECONDS:
+            if POLY_MAX_AGE_SECONDS > 0 and age_seconds > POLY_MAX_AGE_SECONDS:
                 return False
         elif venue == "kalshi":
-            if age_seconds > KALSHI_MAX_AGE_SECONDS:
+            if KALSHI_MAX_AGE_SECONDS > 0 and age_seconds > KALSHI_MAX_AGE_SECONDS:
                 return False
     return True
 
