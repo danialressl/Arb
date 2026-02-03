@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -12,7 +13,7 @@ ORDERBOOKS: Dict[Tuple[str, str, str], Dict[str, object]] = {}
 
 logger = logging.getLogger(__name__)
 
-KALSHI_FEE_BPS = float(os.getenv("ARBV2_KALSHI_FEE_BPS", "100"))
+KALSHI_FEE_RATE = float(os.getenv("ARBV2_KALSHI_FEE_RATE", "0.07"))
 POLY_FEE_BPS = float(os.getenv("ARBV2_POLY_FEE_BPS", "0"))
 SLIPPAGE_BPS = float(os.getenv("ARBV2_ARB_SLIPPAGE_BPS", "10"))
 MAX_STALENESS_SECONDS = float(os.getenv("ARBV2_ARB_MAX_STALENESS_SECONDS", "3"))
@@ -173,12 +174,26 @@ def apply_fees(venue: str, raw_price: Optional[float], Q: float) -> Optional[flo
         return None
     price = raw_price
     if venue == "kalshi":
-        price *= 1 + KALSHI_FEE_BPS / 10_000
+        if Q > 0:
+            fee_total = _kalshi_fee_total(Q, price)
+            price += fee_total / Q
     if venue == "polymarket":
         price *= 1 + POLY_FEE_BPS / 10_000
     if SLIPPAGE_BPS > 0:
         price *= 1 + SLIPPAGE_BPS / 10_000
     return price
+
+
+def _kalshi_fee_total(contracts: float, price: float) -> float:
+    # Fee formula: round up to next cent of 0.07 * C * P * (1 - P)
+    fee = KALSHI_FEE_RATE * contracts * price * (1 - price)
+    return _round_up_cent(fee)
+
+
+def _round_up_cent(value: float) -> float:
+    if value <= 0:
+        return 0.0
+    return math.ceil(value * 100) / 100.0
 
 
 def evaluate_arb_at_size(

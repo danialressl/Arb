@@ -30,6 +30,7 @@ from arbv2.pricing.arb import (
     Q_MIN,
     confirm_on_trigger,
     post_confirm_decision,
+    signal_edge_bps,
     evaluate_profit_at_size,
     evaluate_profit_rows,
     find_best_arb,
@@ -423,21 +424,18 @@ async def _run_live_loop(
 
 def _scan_arb_events(db_path: str, events: List[EventMarkets], mode: ArbMode) -> None:
     scan_rows: List[tuple] = []
-    best_by_key: Dict[tuple, tuple] = {}
+    latest_by_key: Dict[tuple, tuple] = {}
     for event in events:
         profit_rows = evaluate_profit_rows(event, mode, Q_MIN)
         for row in profit_rows:
             key = (row["arb_type"], row["kalshi_market_id"], row["polymarket_market_id"])
-            profit = float(row["profit"])
-            prev = best_by_key.get(key)
-            if prev is None or profit > prev[3]:
-                best_by_key[key] = (
-                    row["arb_type"],
-                    row["kalshi_market_id"],
-                    row["polymarket_market_id"],
-                    profit,
-                    row["ts_utc"],
-                )
+            latest_by_key[key] = (
+                row["arb_type"],
+                row["kalshi_market_id"],
+                row["polymarket_market_id"],
+                float(row["profit"]),
+                row["ts_utc"],
+            )
         signal = find_best_arb(event, mode)
         if not signal:
             continue
@@ -495,7 +493,7 @@ def _scan_arb_events(db_path: str, events: List[EventMarkets], mode: ArbMode) ->
             signal["direction"],
         )
         _log_signal_details(signal)
-    scan_rows = list(best_by_key.values())
+    scan_rows = list(latest_by_key.values())
     if scan_rows:
         insert_arb_scans(db_path, scan_rows)
     return None

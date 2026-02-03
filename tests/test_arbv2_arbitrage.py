@@ -10,6 +10,7 @@ from arbv2.pricing.arb import (
     get_fill_stats,
     update_orderbook,
     evaluate_arb_at_size,
+    _kalshi_fee_total,
 )
 
 
@@ -96,6 +97,11 @@ class ArbV2ArbitrageTests(unittest.TestCase):
         result = find_best_arb(event, ArbMode.EVENT_OUTCOME, Q_min=200, Q_max=800)
         self.assertIsNotNone(result)
         self.assertEqual(result["size"], 800)
+
+    def test_kalshi_fee_rounds_up_cent(self) -> None:
+        # fee = ceil(0.07 * C * P * (1 - P)) to cents
+        fee = _kalshi_fee_total(100, 0.50)
+        self.assertAlmostEqual(fee, 1.76, places=6)
 
 
 if __name__ == "__main__":
