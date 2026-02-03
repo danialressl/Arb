@@ -31,6 +31,7 @@ from arbv2.pricing.arb import (
     confirm_on_trigger,
     post_confirm_decision,
     signal_edge_bps,
+    evaluate_paired_metrics,
     evaluate_profit_at_size,
     evaluate_profit_rows,
     find_best_arb,
@@ -348,13 +349,14 @@ def _find_market(config, venue: str, market_id: str) -> Optional[Market]:
 async def _run_arb_stream(config) -> None:
     kalshi_markets = fetch_markets(config.db_path, venue="kalshi")
     poly_markets = fetch_markets(config.db_path, venue="polymarket")
+    title_by_market_id = _title_by_market_id(kalshi_markets + poly_markets)
     kalshi_preds = _parse_all(kalshi_markets)
     poly_preds = _parse_all(poly_markets)
     events_event = _build_event_markets(kalshi_markets, poly_markets, kalshi_preds, poly_preds)
     events_binary = _build_binary_events(config.db_path)
     while True:
-        _scan_arb_events(config.db_path, events_event, ArbMode.EVENT_OUTCOME)
-        _scan_arb_events(config.db_path, events_binary, ArbMode.BINARY_MIRROR)
+        _scan_arb_events(config.db_path, events_event, ArbMode.EVENT_OUTCOME, title_by_market_id)
+        _scan_arb_events(config.db_path, events_binary, ArbMode.BINARY_MIRROR, title_by_market_id)
         await asyncio.sleep(2)
 
 
@@ -422,21 +424,40 @@ async def _run_live_loop(
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def _scan_arb_events(db_path: str, events: List[EventMarkets], mode: ArbMode) -> None:
+def _scan_arb_events(
+    db_path: str,
+    events: List[EventMarkets],
+    mode: ArbMode,
+    title_by_market_id: Dict[str, str],
+) -> None:
     scan_rows: List[tuple] = []
     latest_by_key: Dict[tuple, tuple] = {}
     for event in events:
-        profit_rows = evaluate_profit_rows(event, mode, Q_MIN)
-        for row in profit_rows:
-            key = (row["arb_type"], row["kalshi_market_id"], row["polymarket_market_id"])
-            latest_by_key[key] = (
-                row["arb_type"],
-                row["kalshi_market_id"],
-                row["polymarket_market_id"],
-                float(row["profit"]),
-                row["ts_utc"],
-            )
+        metrics = evaluate_paired_metrics(event, mode)
+        if metrics:
+            legs = metrics.get("legs") or []
+            kalshi_market_id = None
+            polymarket_market_id = None
+            for leg in legs:
+                if leg.get("venue") == "kalshi" and not kalshi_market_id:
+                    kalshi_market_id = leg.get("market_id")
+                if leg.get("venue") == "polymarket" and not polymarket_market_id:
+                    polymarket_market_id = leg.get("market_id")
+            if kalshi_market_id and polymarket_market_id:
+                event_title = title_by_market_id.get(kalshi_market_id) or title_by_market_id.get(polymarket_market_id)
+                key = (metrics["arb_type"], kalshi_market_id, polymarket_market_id)
+                latest_by_key[key] = (
+                    metrics["arb_type"],
+                    kalshi_market_id,
+                    polymarket_market_id,
+                    float(metrics["profit"]),
+                    metrics["ts_utc"],
+                    metrics.get("event_id"),
+                    metrics.get("size"),
+                    event_title,
+                )
         signal = find_best_arb(event, mode)
+        # Continue to use signal below for emission.
         if not signal:
             continue
         if not should_emit_signal(event, mode, signal):
@@ -733,6 +754,15 @@ def _count_outcomes(markets: List[Market]) -> dict:
         label = market.outcome_label or "UNKNOWN"
         counts[label] = counts.get(label, 0) + 1
     return counts
+
+
+def _title_by_market_id(markets: List[Market]) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    for market in markets:
+        title = market.event_title or market.title or ""
+        if title and market.market_id not in mapping:
+            mapping[market.market_id] = str(title)
+    return mapping
 
 
 def _build_event_markets(

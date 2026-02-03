@@ -37,15 +37,6 @@ async def stream_books(
     except ModuleNotFoundError as exc:
         raise RuntimeError("cryptography is required for Kalshi WS auth; install it first.") from exc
 
-    ws_headers = _kalshi_ws_headers(
-        config.kalshi_api_key,
-        config.kalshi_private_key_path,
-        config.kalshi_ws_url,
-        hashes,
-        serialization,
-        padding,
-    )
-
     market_by_ticker = {m.market_id: m for m in markets}
     market_id_to_ticker: Dict[str, str] = {}
     levels_by_ticker: Dict[str, Dict[str, Dict[float, float]]] = {}
@@ -53,10 +44,17 @@ async def stream_books(
     tickers = list(market_by_ticker.keys())
     delta_count = 0
 
-    connect_kwargs = _ws_connect_kwargs(ws_headers)
-
     while True:
         try:
+            ws_headers = _kalshi_ws_headers(
+                config.kalshi_api_key,
+                config.kalshi_private_key_path,
+                config.kalshi_ws_url,
+                hashes,
+                serialization,
+                padding,
+            )
+            connect_kwargs = _ws_connect_kwargs(ws_headers)
             async with websockets.connect(ws_url, **connect_kwargs) as ws:
                 params = {
                     "channels": ["orderbook_delta"],

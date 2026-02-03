@@ -86,9 +86,10 @@ class ArbV2ArbitrageTests(unittest.TestCase):
 
     def test_find_best_ladder(self) -> None:
         now = datetime.now(timezone.utc)
-        for venue, mid in (("kalshi", "K-A"), ("kalshi", "K-B"), ("polymarket", "P-A"), ("polymarket", "P-B")):
-            price = 0.40 if mid.endswith("A") else 0.55
-            update_orderbook(venue, mid, "A" if mid.endswith("A") else "B", bids=[], asks=[(price, 2000)], last_update_ts_utc=now)
+        update_orderbook("kalshi", "K-A", "A", bids=[], asks=[(0.40, 500), (0.60, 500)], last_update_ts_utc=now)
+        update_orderbook("kalshi", "K-B", "B", bids=[], asks=[(0.60, 500)], last_update_ts_utc=now)
+        update_orderbook("polymarket", "P-A", "A", bids=[], asks=[(0.45, 500)], last_update_ts_utc=now)
+        update_orderbook("polymarket", "P-B", "B", bids=[], asks=[(0.55, 500), (0.70, 500)], last_update_ts_utc=now)
         event = EventMarkets(
             kalshi_by_outcome={"A": "K-A", "B": "K-B"},
             polymarket_by_outcome={"A": "P-A", "B": "P-B"},
@@ -96,12 +97,42 @@ class ArbV2ArbitrageTests(unittest.TestCase):
         )
         result = find_best_arb(event, ArbMode.EVENT_OUTCOME, Q_min=200, Q_max=800)
         self.assertIsNotNone(result)
-        self.assertEqual(result["size"], 800)
+        self.assertEqual(result["size"], 500)
 
     def test_kalshi_fee_rounds_up_cent(self) -> None:
         # fee = ceil(0.07 * C * P * (1 - P)) to cents
         fee = _kalshi_fee_total(100, 0.50)
         self.assertAlmostEqual(fee, 1.76, places=6)
+
+    def test_paired_sizing_stops_on_marginal_cost(self) -> None:
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        update_orderbook("kalshi", "K-A", "A", bids=[], asks=[(0.40, 100), (0.90, 100)], last_update_ts_utc=now)
+        update_orderbook("polymarket", "P-B", "B", bids=[], asks=[(0.50, 200)], last_update_ts_utc=now)
+        update_orderbook("polymarket", "P-A", "A", bids=[], asks=[(0.99, 1)], last_update_ts_utc=now)
+        update_orderbook("kalshi", "K-B", "B", bids=[], asks=[(0.99, 1)], last_update_ts_utc=now)
+        event = EventMarkets(
+            kalshi_by_outcome={"A": "K-A", "B": "K-B"},
+            polymarket_by_outcome={"A": "P-A", "B": "P-B"},
+            outcomes=["A", "B"],
+        )
+        result = find_best_arb(event, ArbMode.EVENT_OUTCOME, Q_min=1, Q_max=1000)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["size"], 100)
+
+    def test_paired_sizing_uses_deeper_levels(self) -> None:
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        update_orderbook("kalshi", "K-A", "A", bids=[], asks=[(0.30, 150), (0.40, 150)], last_update_ts_utc=now)
+        update_orderbook("polymarket", "P-B", "B", bids=[], asks=[(0.50, 300)], last_update_ts_utc=now)
+        update_orderbook("polymarket", "P-A", "A", bids=[], asks=[(0.99, 1)], last_update_ts_utc=now)
+        update_orderbook("kalshi", "K-B", "B", bids=[], asks=[(0.99, 1)], last_update_ts_utc=now)
+        event = EventMarkets(
+            kalshi_by_outcome={"A": "K-A", "B": "K-B"},
+            polymarket_by_outcome={"A": "P-A", "B": "P-B"},
+            outcomes=["A", "B"],
+        )
+        result = find_best_arb(event, ArbMode.EVENT_OUTCOME, Q_min=1, Q_max=1000)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["size"], 300)
 
 
 if __name__ == "__main__":

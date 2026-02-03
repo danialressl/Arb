@@ -255,15 +255,25 @@ def find_best_arb(
 ) -> Optional[Dict[str, object]]:
     if Q_min <= 0 or Q_max < Q_min:
         return None
-    best = None
-    Q = Q_min
-    while Q <= Q_max:
-        result = evaluate_arb_at_size(event, arb_mode, Q)
-        if result is None:
-            break
-        best = result
-        Q *= 2
-    return best
+    if arb_mode == ArbMode.EVENT_OUTCOME:
+        return _evaluate_event_outcome_paired(event, Q_min, Q_max)
+    if arb_mode == ArbMode.BINARY_MIRROR:
+        return _evaluate_binary_mirror_paired(event, Q_min, Q_max)
+    return None
+
+
+def evaluate_paired_metrics(
+    event: EventMarkets,
+    arb_mode: ArbMode,
+    Q_max: float = Q_MAX,
+) -> Optional[Dict[str, object]]:
+    if Q_max <= 0:
+        return None
+    if arb_mode == ArbMode.EVENT_OUTCOME:
+        return _evaluate_event_outcome_paired_metrics(event, Q_max)
+    if arb_mode == ArbMode.BINARY_MIRROR:
+        return _evaluate_binary_mirror_paired_metrics(event, Q_max)
+    return None
 
 
 def _maybe_build_signal(best: Optional[Dict[str, object]], best_profit, candidate: Optional[Dict[str, object]]):
@@ -732,6 +742,504 @@ def _profit_binary_mirror_rows(event: EventMarkets, Q: float, now_utc: datetime)
     return [row for row in rows if row]
 
 
+def _evaluate_event_outcome_paired(
+    event: EventMarkets, Q_min: float, Q_max: float
+) -> Optional[Dict[str, object]]:
+    if len(event.outcomes) != 2:
+        return None
+    outcome_a, outcome_b = event.outcomes
+    keys = [
+        ("kalshi", event.kalshi_by_outcome.get(outcome_a), outcome_a),
+        ("kalshi", event.kalshi_by_outcome.get(outcome_b), outcome_b),
+        ("polymarket", event.polymarket_by_outcome.get(outcome_a), outcome_a),
+        ("polymarket", event.polymarket_by_outcome.get(outcome_b), outcome_b),
+    ]
+    if not _books_fresh_by_venue(keys):
+        return None
+    if not _books_fresh(keys, datetime.now(timezone.utc)):
+        return None
+
+    k_a = event.kalshi_by_outcome.get(outcome_a)
+    k_b = event.kalshi_by_outcome.get(outcome_b)
+    p_a = event.polymarket_by_outcome.get(outcome_a)
+    p_b = event.polymarket_by_outcome.get(outcome_b)
+    if not k_a or not k_b or not p_a or not p_b:
+        return None
+
+    best = None
+    best_profit = None
+
+    legs = [
+        ("kalshi", k_a, outcome_a),
+        ("polymarket", p_b, outcome_b),
+    ]
+    result = _paired_direction_signal(
+        event,
+        ArbMode.EVENT_OUTCOME,
+        f"{outcome_a}|{outcome_b}",
+        "KALSHI:A + POLY:B",
+        legs,
+        Q_min,
+        Q_max,
+    )
+    best = _maybe_build_signal(best, best_profit, result)
+    if best:
+        best_profit = best["profit"]
+
+    legs = [
+        ("polymarket", p_a, outcome_a),
+        ("kalshi", k_b, outcome_b),
+    ]
+    result = _paired_direction_signal(
+        event,
+        ArbMode.EVENT_OUTCOME,
+        f"{outcome_a}|{outcome_b}",
+        "POLY:A + KALSHI:B",
+        legs,
+        Q_min,
+        Q_max,
+    )
+    best = _maybe_build_signal(best, best_profit, result)
+    return best
+
+
+def _evaluate_event_outcome_paired_metrics(event: EventMarkets, Q_max: float) -> Optional[Dict[str, object]]:
+    if len(event.outcomes) != 2:
+        return None
+    outcome_a, outcome_b = event.outcomes
+    keys = [
+        ("kalshi", event.kalshi_by_outcome.get(outcome_a), outcome_a),
+        ("kalshi", event.kalshi_by_outcome.get(outcome_b), outcome_b),
+        ("polymarket", event.polymarket_by_outcome.get(outcome_a), outcome_a),
+        ("polymarket", event.polymarket_by_outcome.get(outcome_b), outcome_b),
+    ]
+    if not _books_fresh_by_venue(keys):
+        return None
+    if not _books_fresh(keys, datetime.now(timezone.utc)):
+        return None
+
+    k_a = event.kalshi_by_outcome.get(outcome_a)
+    k_b = event.kalshi_by_outcome.get(outcome_b)
+    p_a = event.polymarket_by_outcome.get(outcome_a)
+    p_b = event.polymarket_by_outcome.get(outcome_b)
+    if not k_a or not k_b or not p_a or not p_b:
+        return None
+
+    candidates: List[Dict[str, object]] = []
+    legs = [
+        ("kalshi", k_a, outcome_a),
+        ("polymarket", p_b, outcome_b),
+    ]
+    metrics = _paired_direction_metrics(
+        event,
+        ArbMode.EVENT_OUTCOME,
+        f"{outcome_a}|{outcome_b}",
+        "KALSHI:A + POLY:B",
+        legs,
+        Q_max,
+    )
+    if metrics:
+        candidates.append(metrics)
+
+    legs = [
+        ("polymarket", p_a, outcome_a),
+        ("kalshi", k_b, outcome_b),
+    ]
+    metrics = _paired_direction_metrics(
+        event,
+        ArbMode.EVENT_OUTCOME,
+        f"{outcome_a}|{outcome_b}",
+        "POLY:A + KALSHI:B",
+        legs,
+        Q_max,
+    )
+    if metrics:
+        candidates.append(metrics)
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item["profit"])
+
+
+def _evaluate_binary_mirror_paired(event: EventMarkets, Q_min: float, Q_max: float) -> Optional[Dict[str, object]]:
+    keys = [
+        ("kalshi", event.kalshi_by_outcome.get("YES"), "YES"),
+        ("kalshi", event.kalshi_by_outcome.get("NO"), "NO"),
+        ("polymarket", event.polymarket_by_outcome.get("YES"), "YES"),
+        ("polymarket", event.polymarket_by_outcome.get("NO"), "NO"),
+    ]
+    if not _books_fresh_by_venue(keys):
+        return None
+    if not _books_fresh(keys, datetime.now(timezone.utc)):
+        return None
+
+    k_yes = event.kalshi_by_outcome.get("YES")
+    k_no = event.kalshi_by_outcome.get("NO")
+    p_yes = event.polymarket_by_outcome.get("YES")
+    p_no = event.polymarket_by_outcome.get("NO")
+    if not k_yes or not k_no or not p_yes or not p_no:
+        return None
+
+    best = None
+    best_profit = None
+
+    legs = [
+        ("kalshi", k_yes, "YES"),
+        ("polymarket", p_no, "NO"),
+    ]
+    result = _paired_direction_signal(
+        event,
+        ArbMode.BINARY_MIRROR,
+        "YES/NO",
+        "KALSHI:YES + POLY:NO",
+        legs,
+        Q_min,
+        Q_max,
+    )
+    best = _maybe_build_signal(best, best_profit, result)
+    if best:
+        best_profit = best["profit"]
+
+    legs = [
+        ("polymarket", p_yes, "YES"),
+        ("kalshi", k_no, "NO"),
+    ]
+    result = _paired_direction_signal(
+        event,
+        ArbMode.BINARY_MIRROR,
+        "YES/NO",
+        "POLY:YES + KALSHI:NO",
+        legs,
+        Q_min,
+        Q_max,
+    )
+    best = _maybe_build_signal(best, best_profit, result)
+    return best
+
+
+def _evaluate_binary_mirror_paired_metrics(event: EventMarkets, Q_max: float) -> Optional[Dict[str, object]]:
+    keys = [
+        ("kalshi", event.kalshi_by_outcome.get("YES"), "YES"),
+        ("kalshi", event.kalshi_by_outcome.get("NO"), "NO"),
+        ("polymarket", event.polymarket_by_outcome.get("YES"), "YES"),
+        ("polymarket", event.polymarket_by_outcome.get("NO"), "NO"),
+    ]
+    if not _books_fresh_by_venue(keys):
+        return None
+    if not _books_fresh(keys, datetime.now(timezone.utc)):
+        return None
+
+    k_yes = event.kalshi_by_outcome.get("YES")
+    k_no = event.kalshi_by_outcome.get("NO")
+    p_yes = event.polymarket_by_outcome.get("YES")
+    p_no = event.polymarket_by_outcome.get("NO")
+    if not k_yes or not k_no or not p_yes or not p_no:
+        return None
+
+    candidates: List[Dict[str, object]] = []
+    legs = [
+        ("kalshi", k_yes, "YES"),
+        ("polymarket", p_no, "NO"),
+    ]
+    metrics = _paired_direction_metrics(
+        event,
+        ArbMode.BINARY_MIRROR,
+        "YES/NO",
+        "KALSHI:YES + POLY:NO",
+        legs,
+        Q_max,
+    )
+    if metrics:
+        candidates.append(metrics)
+
+    legs = [
+        ("polymarket", p_yes, "YES"),
+        ("kalshi", k_no, "NO"),
+    ]
+    metrics = _paired_direction_metrics(
+        event,
+        ArbMode.BINARY_MIRROR,
+        "YES/NO",
+        "POLY:YES + KALSHI:NO",
+        legs,
+        Q_max,
+    )
+    if metrics:
+        candidates.append(metrics)
+
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item["profit"])
+
+
+def _paired_direction_signal(
+    event: EventMarkets,
+    arb_type: ArbMode,
+    outcome_label: str,
+    direction: str,
+    legs: List[Tuple[str, str, str]],
+    Q_min: float,
+    Q_max: float,
+) -> Optional[Dict[str, object]]:
+    (venue_a, market_a, outcome_a), (venue_b, market_b, outcome_b) = legs
+    asks_a = _asks_for(venue_a, market_a, outcome_a)
+    asks_b = _asks_for(venue_b, market_b, outcome_b)
+    if not asks_a or not asks_b:
+        return None
+    result = _paired_fill(asks_a, asks_b, venue_a, venue_b, Q_min, Q_max)
+    if not result:
+        return None
+    size = result["size"]
+    total_cost = result["total_cost"]
+    payout = size * 1.0
+    profit = payout - total_cost
+    if profit <= 0:
+        return None
+    roi = profit / total_cost if total_cost else 0.0
+    min_roi, min_profit = _thresholds(arb_type)
+    if roi < min_roi or profit < min_profit:
+        return None
+    leg_a = _paired_leg_dict(venue_a, market_a, outcome_a, result["leg_a"])
+    leg_b = _paired_leg_dict(venue_b, market_b, outcome_b, result["leg_b"])
+    return {
+        "arb_type": arb_type.value,
+        "event_id": event.event_id,
+        "market_id": outcome_label,
+        "outcome_label": outcome_label,
+        "direction": direction,
+        "size": size,
+        "legs": [leg_a, leg_b],
+        "total_cost": total_cost,
+        "payout": payout,
+        "profit": profit,
+        "roi": roi,
+        "ts_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _paired_direction_metrics(
+    event: EventMarkets,
+    arb_type: ArbMode,
+    outcome_label: str,
+    direction: str,
+    legs: List[Tuple[str, str, str]],
+    Q_max: float,
+) -> Optional[Dict[str, object]]:
+    (venue_a, market_a, outcome_a), (venue_b, market_b, outcome_b) = legs
+    asks_a = _asks_for(venue_a, market_a, outcome_a)
+    asks_b = _asks_for(venue_b, market_b, outcome_b)
+    if not asks_a or not asks_b:
+        return None
+    result = _paired_fill(asks_a, asks_b, venue_a, venue_b, 0.0, Q_max)
+    if not result:
+        result = _paired_probe(asks_a, asks_b, venue_a, venue_b)
+        if not result:
+            return None
+    size = result["size"]
+    total_cost = result["total_cost"]
+    payout = size * 1.0
+    profit = payout - total_cost
+    roi = profit / total_cost if total_cost else 0.0
+    leg_a = _paired_leg_dict(venue_a, market_a, outcome_a, result["leg_a"])
+    leg_b = _paired_leg_dict(venue_b, market_b, outcome_b, result["leg_b"])
+    return {
+        "arb_type": arb_type.value,
+        "event_id": event.event_id,
+        "market_id": outcome_label,
+        "outcome_label": outcome_label,
+        "direction": direction,
+        "size": size,
+        "legs": [leg_a, leg_b],
+        "total_cost": total_cost,
+        "payout": payout,
+        "profit": profit,
+        "roi": roi,
+        "ts_utc": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _asks_for(venue: str, market_id: str, outcome_label: str) -> List[Tuple[float, float]]:
+    book = ORDERBOOKS.get((venue, market_id, outcome_label))
+    if not book:
+        return []
+    asks = book.get("asks") or []
+    return [(float(price), float(qty)) for price, qty in asks if qty and price is not None]
+
+
+def _paired_fill(
+    asks_a: List[Tuple[float, float]],
+    asks_b: List[Tuple[float, float]],
+    venue_a: str,
+    venue_b: str,
+    Q_min: float,
+    Q_max: float,
+) -> Optional[Dict[str, object]]:
+    idx_a = 0
+    idx_b = 0
+    if not asks_a or not asks_b:
+        return None
+    price_a, qty_a = asks_a[0]
+    price_b, qty_b = asks_b[0]
+    remaining_a = int(qty_a)
+    remaining_b = int(qty_b)
+    size = 0
+    total_cost = 0.0
+    leg_a_cost = 0.0
+    leg_b_cost = 0.0
+    leg_a_raw = 0.0
+    leg_b_raw = 0.0
+    worst_a = None
+    worst_b = None
+
+    max_size = int(Q_max)
+    while size < max_size:
+        while remaining_a <= 0:
+            idx_a += 1
+            if idx_a >= len(asks_a):
+                return _paired_result(
+                    size,
+                    total_cost,
+                    leg_a_cost,
+                    leg_b_cost,
+                    leg_a_raw,
+                    leg_b_raw,
+                    worst_a,
+                    worst_b,
+                    Q_min,
+                )
+            price_a, qty_a = asks_a[idx_a]
+            remaining_a = int(qty_a)
+        while remaining_b <= 0:
+            idx_b += 1
+            if idx_b >= len(asks_b):
+                return _paired_result(
+                    size,
+                    total_cost,
+                    leg_a_cost,
+                    leg_b_cost,
+                    leg_a_raw,
+                    leg_b_raw,
+                    worst_a,
+                    worst_b,
+                    Q_min,
+                )
+            price_b, qty_b = asks_b[idx_b]
+            remaining_b = int(qty_b)
+
+        eff_a = _effective_price_per_contract(venue_a, price_a)
+        eff_b = _effective_price_per_contract(venue_b, price_b)
+        if eff_a + eff_b >= 1.0:
+            break
+
+        size += 1
+        total_cost += eff_a + eff_b
+        leg_a_cost += eff_a
+        leg_b_cost += eff_b
+        leg_a_raw += price_a
+        leg_b_raw += price_b
+        worst_a = price_a
+        worst_b = price_b
+        remaining_a -= 1
+        remaining_b -= 1
+
+    return _paired_result(
+        size,
+        total_cost,
+        leg_a_cost,
+        leg_b_cost,
+        leg_a_raw,
+        leg_b_raw,
+        worst_a,
+        worst_b,
+        Q_min,
+    )
+
+
+def _paired_probe(
+    asks_a: List[Tuple[float, float]],
+    asks_b: List[Tuple[float, float]],
+    venue_a: str,
+    venue_b: str,
+) -> Optional[Dict[str, object]]:
+    if not asks_a or not asks_b:
+        return None
+    price_a, qty_a = asks_a[0]
+    price_b, qty_b = asks_b[0]
+    if qty_a <= 0 or qty_b <= 0:
+        return None
+    eff_a = _effective_price_per_contract(venue_a, price_a)
+    eff_b = _effective_price_per_contract(venue_b, price_b)
+    total_cost = eff_a + eff_b
+    return {
+        "size": 1.0,
+        "total_cost": total_cost,
+        "leg_a": {
+            "raw_avg": price_a,
+            "eff_avg": eff_a,
+            "worst_price": price_a,
+        },
+        "leg_b": {
+            "raw_avg": price_b,
+            "eff_avg": eff_b,
+            "worst_price": price_b,
+        },
+    }
+
+
+def _paired_result(
+    size: int,
+    total_cost: float,
+    leg_a_cost: float,
+    leg_b_cost: float,
+    leg_a_raw: float,
+    leg_b_raw: float,
+    worst_a: Optional[float],
+    worst_b: Optional[float],
+    Q_min: float,
+) -> Optional[Dict[str, object]]:
+    if size <= 0 or size < Q_min:
+        return None
+    return {
+        "size": float(size),
+        "total_cost": total_cost,
+        "leg_a": {
+            "raw_avg": leg_a_raw / size if size else None,
+            "eff_avg": leg_a_cost / size if size else None,
+            "worst_price": worst_a,
+        },
+        "leg_b": {
+            "raw_avg": leg_b_raw / size if size else None,
+            "eff_avg": leg_b_cost / size if size else None,
+            "worst_price": worst_b,
+        },
+    }
+
+
+def _effective_price_per_contract(venue: str, price: float) -> float:
+    eff = price
+    if venue == "kalshi":
+        eff += _kalshi_fee_total(1, price)
+    elif venue == "polymarket":
+        if POLY_FEE_BPS:
+            eff *= 1 + POLY_FEE_BPS / 10_000
+    if SLIPPAGE_BPS > 0:
+        eff *= 1 + SLIPPAGE_BPS / 10_000
+    return eff
+
+
+def _paired_leg_dict(venue: str, market_id: str, outcome_label: str, data: Dict[str, object]) -> Dict[str, object]:
+    side = "NO" if str(outcome_label).upper() == "NO" else "YES"
+    return {
+        "venue": venue,
+        "side": side,
+        "market_id": market_id,
+        "outcome_label": outcome_label,
+        "raw_vwap": data.get("raw_avg"),
+        "eff_vwap": data.get("eff_avg"),
+        "worst_price": data.get("worst_price"),
+    }
+
+
 def _books_fresh(keys: List[Tuple[str, Optional[str], str]], now_utc: datetime) -> bool:
     last_updates: List[datetime] = []
     for venue, market_id, outcome in keys:
@@ -872,6 +1380,7 @@ def post_confirm_decision(
         detected_ts_ms = int(detected_ts)
     except (TypeError, ValueError):
         return {"ok": False, "reason": "invalid_detected_ts"}
+    reasons: List[str] = []
     legs = signal.get("legs") or []
     keys: List[Tuple[str, Optional[str], str]] = []
     for leg in legs:
@@ -879,23 +1388,27 @@ def post_confirm_decision(
         market_id = str(leg.get("market_id") or "")
         outcome_label = str(leg.get("outcome_label") or "")
         if not venue or not market_id or not outcome_label:
-            return {"ok": False, "reason": "missing_book"}
+            reasons.append("missing_book")
+            continue
         book = ORDERBOOKS.get((venue, market_id, outcome_label))
         if not book:
-            return {"ok": False, "reason": "missing_book"}
+            reasons.append("missing_book")
+            continue
         fetched_at = book.get("fetched_at_ts")
         if not isinstance(fetched_at, (int, float)):
-            return {"ok": False, "reason": "missing_fetched_at"}
-        if float(fetched_at) * 1000 <= detected_ts_ms:
-            return {"ok": False, "reason": "not_updated_since_detect"}
-        keys.append((venue, market_id, outcome_label))
-    if not _books_fresh_by_venue(keys):
-        return {"ok": False, "reason": "stale_book"}
+            reasons.append("missing_fetched_at")
+        else:
+            if float(fetched_at) * 1000 <= detected_ts_ms:
+                reasons.append("not_updated_since_detect")
+            keys.append((venue, market_id, outcome_label))
+    if keys and not _books_fresh_by_venue(keys):
+        reasons.append("stale_book")
 
     size = float(signal.get("size") or 0.0)
     if size <= 0:
-        return {"ok": False, "reason": "invalid_size"}
+        reasons.append("invalid_size")
     eff_prices: List[float] = []
+    can_price = True
     for leg in legs:
         venue = str(leg.get("venue"))
         market_id = str(leg.get("market_id"))
@@ -903,23 +1416,51 @@ def post_confirm_decision(
         side = str(leg.get("side") or "YES")
         stats = get_fill_stats(venue, market_id, outcome_label, side, size)
         if not stats.get("ok"):
-            return {"ok": False, "reason": "insufficient_depth"}
+            reasons.append("insufficient_depth")
+            can_price = False
+            continue
         eff_price = apply_fees(venue, stats.get("vwap_price"), size)
         if eff_price is None:
-            return {"ok": False, "reason": "missing_price"}
+            reasons.append("missing_price")
+            can_price = False
+            continue
         eff_price *= 1 + (MAX_SLIPPAGE_BPS / 10_000)
         eff_prices.append(eff_price)
-    total_price = sum(eff_prices)
-    total_cost = size * total_price
-    expected_pnl = (size * 1.0) - total_cost
-    edge_bps = (expected_pnl / size) * 10_000 if size > 0 else 0.0
-    if edge_bps < MIN_EDGE_BPS:
-        return {"ok": False, "reason": "edge_below_min", "edge_bps": edge_bps, "expected_pnl_usd": expected_pnl}
-    if expected_pnl <= 0:
-        return {"ok": False, "reason": "non_positive_pnl", "edge_bps": edge_bps, "expected_pnl_usd": expected_pnl}
+    expected_pnl = None
+    edge_bps = None
+    if can_price and size > 0 and eff_prices:
+        total_price = sum(eff_prices)
+        total_cost = size * total_price
+        expected_pnl = (size * 1.0) - total_cost
+        edge_bps = (expected_pnl / size) * 10_000 if size > 0 else 0.0
+        if edge_bps < MIN_EDGE_BPS:
+            reasons.append("edge_below_min")
+        if expected_pnl <= 0:
+            reasons.append("non_positive_pnl")
 
     prev = POST_CONFIRM_CACHE.get(key)
-    edge_bps = edge_bps
+    age_ms = None
+    edge_decay = None
+    if prev and edge_bps is not None:
+        age_ms = now_ms - int(prev["ts"])
+        if age_ms > POST_CONFIRM_WINDOW_MS:
+            reasons.append("window_expired")
+        edge_decay = float(prev["edge_bps"]) - edge_bps
+        if edge_decay > POST_CONFIRM_MAX_EDGE_DECAY_BPS:
+            reasons.append("edge_decay")
+
+    if reasons:
+        return {
+            "ok": False,
+            "reason": ",".join(sorted(set(reasons))),
+            "edge_bps": edge_bps,
+            "prev_edge_bps": float(prev["edge_bps"]) if prev else None,
+            "edge_decay_bps": edge_decay,
+            "age_ms": age_ms,
+            "expected_pnl_usd": expected_pnl,
+            "limit_prices": eff_prices,
+        }
+
     if not prev:
         POST_CONFIRM_CACHE[key] = {
             "ts": float(now_ms),
@@ -933,8 +1474,7 @@ def post_confirm_decision(
             "expected_pnl_usd": expected_pnl,
             "limit_prices": eff_prices,
         }
-    age_ms = now_ms - int(prev["ts"])
-    if age_ms > POST_CONFIRM_WINDOW_MS:
+    if age_ms is not None and age_ms > POST_CONFIRM_WINDOW_MS:
         POST_CONFIRM_CACHE[key] = {
             "ts": float(now_ms),
             "edge_bps": edge_bps,
@@ -949,8 +1489,7 @@ def post_confirm_decision(
             "expected_pnl_usd": expected_pnl,
             "limit_prices": eff_prices,
         }
-    edge_decay = float(prev["edge_bps"]) - edge_bps
-    if edge_decay > POST_CONFIRM_MAX_EDGE_DECAY_BPS:
+    if edge_decay is not None and edge_decay > POST_CONFIRM_MAX_EDGE_DECAY_BPS:
         POST_CONFIRM_CACHE.pop(key, None)
         logger.debug("post-confirm reject key=%s edge_decay=%.2f", key, edge_decay)
         return {

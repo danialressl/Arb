@@ -63,7 +63,10 @@ CREATE TABLE IF NOT EXISTS arb_scans (
     kalshi_market_id TEXT NOT NULL,
     polymarket_market_id TEXT NOT NULL,
     expected_profit REAL,
-    ts_utc TEXT NOT NULL
+    ts_utc TEXT NOT NULL,
+    event_id TEXT,
+    size REAL,
+    event_title TEXT
 );
 """
 
@@ -82,6 +85,7 @@ def init_db(db_path: str) -> None:
         _migrate_predicates_schema(conn)
         _migrate_matches_schema(conn)
         _migrate_prices_schema(conn)
+        _migrate_arb_scans_schema(conn)
         conn.commit()
     finally:
         conn.close()
@@ -237,8 +241,8 @@ def insert_arb_scans(db_path: str, rows: Iterable[tuple]) -> None:
         conn.executemany(
             """
             INSERT INTO arb_scans (
-                arb_type, kalshi_market_id, polymarket_market_id, expected_profit, ts_utc
-            ) VALUES (?, ?, ?, ?, ?)
+                arb_type, kalshi_market_id, polymarket_market_id, expected_profit, ts_utc, event_id, size, event_title
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             rows_list,
         )
@@ -683,3 +687,12 @@ def _migrate_prices_schema(conn: sqlite3.Connection) -> None:
         """
     )
     conn.execute("DROP TABLE prices_old")
+
+
+def _migrate_arb_scans_schema(conn: sqlite3.Connection) -> None:
+    rows = conn.execute("PRAGMA table_info(arb_scans)").fetchall()
+    if not rows:
+        return
+    _ensure_column(conn, "arb_scans", "event_id", "TEXT")
+    _ensure_column(conn, "arb_scans", "size", "REAL")
+    _ensure_column(conn, "arb_scans", "event_title", "TEXT")
