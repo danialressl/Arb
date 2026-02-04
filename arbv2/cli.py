@@ -606,6 +606,9 @@ def _append_confirm_rejection_csv(
     else:
         rejection_reason = decision.get("reason")
     sync_skew_seconds = post_decision.get("sync_skew_seconds") if post_decision else None
+    reason = decision.get("reason")
+    if stage == "post_confirm" and post_decision:
+        reason = post_decision.get("reason")
     row = {
         "event_id": signal.get("event_id"),
         "arb_type": signal.get("arb_type"),
@@ -613,7 +616,7 @@ def _append_confirm_rejection_csv(
         "size_usd": signal.get("size"),
         "detected_ts": detected_ts,
         "stage": stage,
-        "reason": decision.get("reason"),
+        "reason": reason,
         "edge_bps": decision.get("recalculated_edge_bps"),
         "expected_pnl_usd": decision.get("expected_pnl_usd"),
         "raw_vwaps_by_venue": json.dumps(raw_vwap_map, separators=(",", ":")),

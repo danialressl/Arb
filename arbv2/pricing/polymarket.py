@@ -120,6 +120,7 @@ async def stream_books(config: Config, token_map: Dict[str, List[Tuple[Market, s
             async with websockets.connect(url) as ws:
                 await ws.send(json.dumps({"assets_ids": asset_ids, "type": "market"}))
                 logger.info("Polymarket WS subscribed assets=%d", len(asset_ids))
+                backoff_seconds = 1
                 ping_task = asyncio.create_task(_ping(ws))
                 message_count = 0
                 try:
