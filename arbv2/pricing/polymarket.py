@@ -8,7 +8,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import requests
 from arbv2.config import Config
 from arbv2.models import Market, PriceSnapshot
-from arbv2.pricing.arb import update_orderbook
+from arbv2.pricing.arb import set_stream_health, update_orderbook
 from arbv2.storage import insert_prices
 from arbv2.teams import canonicalize_team, league_hint_from_text, league_hint_from_url
 
@@ -120,6 +120,7 @@ async def stream_books(config: Config, token_map: Dict[str, List[Tuple[Market, s
             async with websockets.connect(url) as ws:
                 await ws.send(json.dumps({"assets_ids": asset_ids, "type": "market"}))
                 logger.info("Polymarket WS subscribed assets=%d", len(asset_ids))
+                set_stream_health("polymarket", True)
                 backoff_seconds = 1
                 ping_task = asyncio.create_task(_ping(ws))
                 message_count = 0
@@ -135,9 +136,11 @@ async def stream_books(config: Config, token_map: Dict[str, List[Tuple[Market, s
                     ping_task.cancel()
         except asyncio.CancelledError:
             logger.info("Polymarket WS stream cancelled")
+            set_stream_health("polymarket", False)
             return
         except Exception as exc:
             logger.warning("Polymarket WS stream ended: %s", exc)
+            set_stream_health("polymarket", False)
         await asyncio.sleep(backoff_seconds)
         backoff_seconds = min(backoff_seconds * 2, 60)
 

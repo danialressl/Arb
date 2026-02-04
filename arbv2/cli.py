@@ -35,6 +35,7 @@ from arbv2.pricing.arb import (
     evaluate_profit_at_size,
     evaluate_profit_rows,
     find_best_arb,
+    streams_healthy,
     should_emit_signal,
 )
 from arbv2.storage import (
@@ -354,7 +355,15 @@ async def _run_arb_stream(config) -> None:
     poly_preds = _parse_all(poly_markets)
     events_event = _build_event_markets(kalshi_markets, poly_markets, kalshi_preds, poly_preds)
     events_binary = _build_binary_events(config.db_path)
+    last_health_log = 0.0
     while True:
+        if not streams_healthy(["kalshi", "polymarket"]):
+            now_ts = time.time()
+            if now_ts - last_health_log > 30:
+                logger.warning("Arb scan paused: price streams not healthy")
+                last_health_log = now_ts
+            await asyncio.sleep(1)
+            continue
         _scan_arb_events(config.db_path, events_event, ArbMode.EVENT_OUTCOME, title_by_market_id)
         _scan_arb_events(config.db_path, events_binary, ArbMode.BINARY_MIRROR, title_by_market_id)
         await asyncio.sleep(2)
@@ -606,6 +615,8 @@ def _append_confirm_rejection_csv(
     else:
         rejection_reason = decision.get("reason")
     sync_skew_seconds = post_decision.get("sync_skew_seconds") if post_decision else None
+    kalshi_book_ts_utc = post_decision.get("kalshi_book_ts_utc") if post_decision else None
+    polymarket_book_ts_utc = post_decision.get("polymarket_book_ts_utc") if post_decision else None
     reason = decision.get("reason")
     if stage == "post_confirm" and post_decision:
         reason = post_decision.get("reason")
@@ -627,6 +638,8 @@ def _append_confirm_rejection_csv(
         "confirm_latency_ms": confirm_latency_ms,
         "rejection_reason": rejection_reason,
         "sync_skew_seconds": sync_skew_seconds,
+        "kalshi_book_ts_utc": kalshi_book_ts_utc,
+        "polymarket_book_ts_utc": polymarket_book_ts_utc,
         "first_confirm_edge_bps": post_decision.get("prev_edge_bps") if post_decision else None,
         "second_confirm_edge_bps": post_decision.get("edge_bps") if post_decision else None,
         "confirm_age_ms": post_decision.get("age_ms") if post_decision else None,

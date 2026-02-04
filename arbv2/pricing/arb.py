@@ -41,6 +41,8 @@ POST_CONFIRM_WINDOW_MS = int(os.getenv("ARBV2_POST_CONFIRM_WINDOW_MS", "400"))
 POST_CONFIRM_MAX_EDGE_DECAY_BPS = int(os.getenv("ARBV2_POST_CONFIRM_MAX_EDGE_DECAY_BPS", "50"))
 POST_CONFIRM_MAX_SYNC_SKEW_SECONDS = float(os.getenv("ARBV2_MAX_SYNC_SKEW_SECONDS", "1.5"))
 
+STREAM_HEALTH: Dict[str, bool] = {"polymarket": False, "kalshi": False}
+
 
 class ArbMode(str, Enum):
     EVENT_OUTCOME = "EVENT_OUTCOME"
@@ -134,6 +136,14 @@ def update_orderbook(
         "last_update_ts_utc": _ensure_utc(last_update_ts_utc),
         "fetched_at_ts": time.time(),
     }
+
+
+def set_stream_health(venue: str, healthy: bool) -> None:
+    STREAM_HEALTH[venue] = healthy
+
+
+def streams_healthy(venues: List[str]) -> bool:
+    return all(STREAM_HEALTH.get(venue, False) for venue in venues)
 
 
 def get_fill_stats(
@@ -1386,6 +1396,8 @@ def post_confirm_decision(
     keys: List[Tuple[str, Optional[str], str]] = []
     kalshi_ts = None
     polymarket_ts = None
+    kalshi_ts_utc = None
+    polymarket_ts_utc = None
     for leg in legs:
         venue = str(leg.get("venue") or "")
         market_id = str(leg.get("market_id") or "")
@@ -1413,8 +1425,10 @@ def post_confirm_decision(
             ts_seconds = None
         if venue == "kalshi" and ts_seconds is not None:
             kalshi_ts = ts_seconds if kalshi_ts is None else max(kalshi_ts, ts_seconds)
+            kalshi_ts_utc = datetime.fromtimestamp(kalshi_ts, tz=timezone.utc).isoformat()
         if venue == "polymarket" and ts_seconds is not None:
             polymarket_ts = ts_seconds if polymarket_ts is None else max(polymarket_ts, ts_seconds)
+            polymarket_ts_utc = datetime.fromtimestamp(polymarket_ts, tz=timezone.utc).isoformat()
     if keys and not _books_fresh_by_venue(keys):
         reasons.append("stale_book")
     sync_skew_seconds = None
@@ -1486,6 +1500,8 @@ def post_confirm_decision(
             "expected_pnl_usd": expected_pnl,
             "limit_prices": eff_prices,
             "sync_skew_seconds": sync_skew_seconds,
+            "kalshi_book_ts_utc": kalshi_ts_utc,
+            "polymarket_book_ts_utc": polymarket_ts_utc,
         }
 
     if not prev:
@@ -1501,6 +1517,8 @@ def post_confirm_decision(
             "expected_pnl_usd": expected_pnl,
             "limit_prices": eff_prices,
             "sync_skew_seconds": sync_skew_seconds,
+            "kalshi_book_ts_utc": kalshi_ts_utc,
+            "polymarket_book_ts_utc": polymarket_ts_utc,
         }
     if age_ms is not None and age_ms > POST_CONFIRM_WINDOW_MS:
         POST_CONFIRM_CACHE[key] = {
@@ -1517,6 +1535,8 @@ def post_confirm_decision(
             "expected_pnl_usd": expected_pnl,
             "limit_prices": eff_prices,
             "sync_skew_seconds": sync_skew_seconds,
+            "kalshi_book_ts_utc": kalshi_ts_utc,
+            "polymarket_book_ts_utc": polymarket_ts_utc,
         }
     if edge_decay is not None and edge_decay > POST_CONFIRM_MAX_EDGE_DECAY_BPS:
         POST_CONFIRM_CACHE.pop(key, None)
@@ -1544,6 +1564,8 @@ def post_confirm_decision(
         "expected_pnl_usd": expected_pnl,
         "limit_prices": eff_prices,
         "sync_skew_seconds": sync_skew_seconds,
+        "kalshi_book_ts_utc": kalshi_ts_utc,
+        "polymarket_book_ts_utc": polymarket_ts_utc,
     }
 
 

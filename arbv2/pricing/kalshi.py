@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 from arbv2.config import Config
 from arbv2.models import Market, PriceSnapshot
-from arbv2.pricing.arb import update_orderbook
+from arbv2.pricing.arb import set_stream_health, update_orderbook
 from arbv2.storage import insert_prices
 
 
@@ -67,6 +67,7 @@ async def stream_books(
                 subscribe = {"id": 1, "cmd": "subscribe", "params": params}
                 await ws.send(json.dumps(subscribe))
                 logger.info("Kalshi WS connected and subscribed markets=%d", len(tickers))
+                set_stream_health("kalshi", True)
                 async for message in ws:
                     snapshots = _handle_ws_message(
                         message,
@@ -81,9 +82,11 @@ async def stream_books(
                         logger.debug("Kalshi WS deltas processed=%d", delta_count)
         except asyncio.CancelledError:
             logger.info("Kalshi WS stream cancelled")
+            set_stream_health("kalshi", False)
             return
         except Exception as exc:
             logger.warning("Kalshi WS stream ended: %s", exc)
+            set_stream_health("kalshi", False)
             continue
 
 
