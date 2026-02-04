@@ -35,7 +35,6 @@ from arbv2.pricing.arb import (
     evaluate_profit_at_size,
     evaluate_profit_rows,
     find_best_arb,
-    streams_healthy,
     should_emit_signal,
 )
 from arbv2.storage import (
@@ -355,15 +354,7 @@ async def _run_arb_stream(config) -> None:
     poly_preds = _parse_all(poly_markets)
     events_event = _build_event_markets(kalshi_markets, poly_markets, kalshi_preds, poly_preds)
     events_binary = _build_binary_events(config.db_path)
-    last_health_log = 0.0
     while True:
-        if not streams_healthy(["kalshi", "polymarket"]):
-            now_ts = time.time()
-            if now_ts - last_health_log > 30:
-                logger.warning("Arb scan paused: price streams not healthy")
-                last_health_log = now_ts
-            await asyncio.sleep(1)
-            continue
         _scan_arb_events(config.db_path, events_event, ArbMode.EVENT_OUTCOME, title_by_market_id)
         _scan_arb_events(config.db_path, events_binary, ArbMode.BINARY_MIRROR, title_by_market_id)
         await asyncio.sleep(2)
@@ -628,26 +619,16 @@ def _append_confirm_rejection_csv(
         "detected_ts": detected_ts,
         "stage": stage,
         "reason": reason,
-        "edge_bps": decision.get("recalculated_edge_bps"),
         "expected_pnl_usd": decision.get("expected_pnl_usd"),
-        "raw_vwaps_by_venue": json.dumps(raw_vwap_map, separators=(",", ":")),
-        "eff_vwaps_by_venue": json.dumps(eff_vwap_map, separators=(",", ":")),
-        "confirm_limit_prices_by_venue": json.dumps(limit_price_map, separators=(",", ":")),
         "detected_edge_bps": detected_edge_bps,
         "confirmed_edge_bps": confirmed_edge_bps,
         "confirm_latency_ms": confirm_latency_ms,
-        "rejection_reason": rejection_reason,
         "sync_skew_seconds": sync_skew_seconds,
         "kalshi_book_ts_utc": kalshi_book_ts_utc,
         "polymarket_book_ts_utc": polymarket_book_ts_utc,
-        "first_confirm_edge_bps": post_decision.get("prev_edge_bps") if post_decision else None,
-        "second_confirm_edge_bps": post_decision.get("edge_bps") if post_decision else None,
-        "confirm_age_ms": post_decision.get("age_ms") if post_decision else None,
         "edge_decay_bps": post_decision.get("edge_decay_bps") if post_decision else None,
-        "post_confirm_reason": post_decision.get("reason") if post_decision else None,
         "venues": json.dumps([leg.get("venue") for leg in legs], separators=(",", ":")),
         "markets": json.dumps([leg.get("market_id") for leg in legs], separators=(",", ":")),
-        "sides": json.dumps([leg.get("side") for leg in legs], separators=(",", ":")),
     }
     write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
     with open(csv_path, "a", newline="", encoding="utf-8") as handle:
