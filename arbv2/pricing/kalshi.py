@@ -43,6 +43,8 @@ async def stream_books(
     ws_url = config.kalshi_ws_url.rstrip("/")
     tickers = list(market_by_ticker.keys())
     delta_count = 0
+    price_queue: "asyncio.Queue[List[PriceSnapshot]]" = asyncio.Queue()
+    flush_task = asyncio.create_task(_flush_prices(price_queue, db_path))
 
     while True:
         try:
@@ -78,18 +80,42 @@ async def stream_books(
                         market_by_ticker,
                     )
                     if snapshots:
-                        insert_prices(db_path, snapshots)
+                        price_queue.put_nowait(snapshots)
                     delta_count += 1
                     if delta_count % 200 == 0:
                         logger.debug("Kalshi WS deltas processed=%d", delta_count)
         except asyncio.CancelledError:
             logger.info("Kalshi WS stream cancelled")
             set_stream_health("kalshi", False)
+            flush_task.cancel()
+            await asyncio.gather(flush_task, return_exceptions=True)
             return
         except Exception as exc:
             logger.warning("Kalshi WS stream ended: %s", exc)
             set_stream_health("kalshi", False)
             continue
+
+
+async def _flush_prices(
+    queue: "asyncio.Queue[List[PriceSnapshot]]",
+    db_path: str,
+    *,
+    max_batch: int = 500,
+    flush_interval: float = 0.5,
+) -> None:
+    buffer: List[PriceSnapshot] = []
+    last_flush = asyncio.get_running_loop().time()
+    while True:
+        timeout = max(0.0, flush_interval - (asyncio.get_running_loop().time() - last_flush))
+        try:
+            batch = await asyncio.wait_for(queue.get(), timeout=timeout)
+            buffer.extend(batch)
+        except asyncio.TimeoutError:
+            pass
+        if buffer and (len(buffer) >= max_batch or (asyncio.get_running_loop().time() - last_flush) >= flush_interval):
+            await asyncio.to_thread(insert_prices, db_path, list(buffer))
+            buffer.clear()
+            last_flush = asyncio.get_running_loop().time()
 
 
 def _handle_ws_message(
