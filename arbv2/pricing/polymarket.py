@@ -3,7 +3,7 @@ import json
 import logging
 import re
 from datetime import datetime, timezone
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Callable
 
 import requests
 from arbv2.config import Config
@@ -114,6 +114,8 @@ async def stream_books(config: Config, token_map: Dict[str, List[Tuple[Market, s
     orderbooks: Dict[str, Dict[str, Dict[float, float]]] = {}
     last_trade: Dict[str, Optional[float]] = {}
     backoff_seconds = 1
+    price_queue: "asyncio.Queue[List[PriceSnapshot]]" = asyncio.Queue()
+    flush_task = asyncio.create_task(_flush_prices(price_queue, db_path))
     while True:
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
@@ -129,18 +131,42 @@ async def stream_books(config: Config, token_map: Dict[str, List[Tuple[Market, s
                             logger.debug("Polymarket WS messages=%d", message_count)
                         snapshots = _handle_message(message, token_map, orderbooks, last_trade)
                         if snapshots:
-                            insert_prices(db_path, snapshots)
+                            price_queue.put_nowait(snapshots)
                 finally:
                     pass
         except asyncio.CancelledError:
             logger.info("Polymarket WS stream cancelled")
             set_stream_health("polymarket", False)
+            flush_task.cancel()
+            await asyncio.gather(flush_task, return_exceptions=True)
             return
         except Exception as exc:
             logger.warning("Polymarket WS stream ended: %s", exc)
             set_stream_health("polymarket", False)
         await asyncio.sleep(backoff_seconds)
         backoff_seconds = min(backoff_seconds * 2, 60)
+
+
+async def _flush_prices(
+    queue: "asyncio.Queue[List[PriceSnapshot]]",
+    db_path: str,
+    *,
+    max_batch: int = 500,
+    flush_interval: float = 0.5,
+) -> None:
+    buffer: List[PriceSnapshot] = []
+    last_flush = asyncio.get_running_loop().time()
+    while True:
+        timeout = max(0.0, flush_interval - (asyncio.get_running_loop().time() - last_flush))
+        try:
+            batch = await asyncio.wait_for(queue.get(), timeout=timeout)
+            buffer.extend(batch)
+        except asyncio.TimeoutError:
+            pass
+        if buffer and (len(buffer) >= max_batch or (asyncio.get_running_loop().time() - last_flush) >= flush_interval):
+            await asyncio.to_thread(insert_prices, db_path, list(buffer))
+            buffer.clear()
+            last_flush = asyncio.get_running_loop().time()
 
 
 def _handle_message(
