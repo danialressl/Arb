@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 
 from arbv2.config import load_config
@@ -245,12 +246,20 @@ def _build_price_targets(
 ):
     poly_token_map = None
     kalshi_markets = None
+    live_poly_ids: Optional[set] = None
 
     if enable_polymarket:
         validate_clob_auth(config)
         matched_ids = fetch_matched_market_ids(config.db_path, venue="polymarket")
         markets = fetch_markets(config.db_path, venue="polymarket")
         markets = [m for m in markets if m.market_id in matched_ids]
+        if markets:
+            now_utc = datetime.now(timezone.utc)
+            before = len(markets)
+            markets = [m for m in markets if _polymarket_market_is_live(m, now_utc)]
+            if before and len(markets) != before:
+                logger.info("Polymarket live filter kept %d/%d markets", len(markets), before)
+            live_poly_ids = {m.market_id for m in markets}
         if markets:
             poly_token_map = build_token_map(markets)
             if limit:
@@ -262,6 +271,13 @@ def _build_price_targets(
         matched_ids = fetch_matched_market_ids(config.db_path, venue="kalshi")
         markets = fetch_markets(config.db_path, venue="kalshi")
         markets = [m for m in markets if m.market_id in matched_ids]
+        if markets and live_poly_ids:
+            pairs = fetch_match_pairs(config.db_path)
+            live_kalshi_ids = {k for k, p in pairs if p in live_poly_ids}
+            before = len(markets)
+            markets = [m for m in markets if m.market_id in live_kalshi_ids]
+            if before and len(markets) != before:
+                logger.info("Kalshi live filter kept %d/%d markets", len(markets), before)
         if markets:
             if limit:
                 markets = markets[: limit]
@@ -270,6 +286,39 @@ def _build_price_targets(
             logger.warning("No matched Kalshi markets found; run match first.")
 
     return poly_token_map, kalshi_markets
+
+
+def _parse_iso_dt(value: object) -> Optional[datetime]:
+    if not value:
+        return None
+    text = str(value)
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _polymarket_market_is_live(market: Market, now_utc: datetime) -> bool:
+    raw = market.raw_json or {}
+    if raw.get("archived") is True or raw.get("closed") is True:
+        return False
+    if raw.get("active") is False:
+        return False
+    if raw.get("acceptingOrders") is False:
+        return False
+    start_val = raw.get("gameStartTime") or raw.get("startTime") or raw.get("startDate")
+    end_val = raw.get("endDate") or raw.get("endDateIso")
+    start_dt = _parse_iso_dt(start_val)
+    end_dt = _parse_iso_dt(end_val)
+    pre_window = timedelta(hours=6)
+    post_window = timedelta(hours=2)
+    if start_dt and now_utc < start_dt - pre_window:
+        return False
+    if end_dt and now_utc > end_dt + post_window:
+        return False
+    return True
 
 
 def _run_arb(config, args) -> int:
