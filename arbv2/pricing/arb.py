@@ -1413,8 +1413,6 @@ def post_confirm_decision(
         if not isinstance(fetched_at, (int, float)):
             reasons.append("missing_fetched_at")
         else:
-            if float(fetched_at) * 1000 <= detected_ts_ms:
-                reasons.append("not_updated_since_detect")
             keys.append((venue, market_id, outcome_label))
         ts_value = book.get("last_update_ts_utc")
         if isinstance(ts_value, datetime):
