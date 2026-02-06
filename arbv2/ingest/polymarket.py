@@ -227,7 +227,12 @@ def _get_json(config: Config, path: str, params: Optional[Dict[str, object]] = N
             time.sleep(0.5 * attempt)
             continue
         if resp.status_code != 200:
-            logger.warning("Polymarket request error %s for %s", resp.status_code, url)
+            logger.warning(
+                "Polymarket request error %s for %s params=%s",
+                resp.status_code,
+                url,
+                params,
+            )
             return {}
         try:
             return resp.json()

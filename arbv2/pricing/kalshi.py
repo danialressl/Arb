@@ -24,7 +24,7 @@ async def stream_books(
         logger.warning("No Kalshi markets to subscribe to")
         return
     if not config.kalshi_api_key:
-        raise RuntimeError("Missing Kalshi API key; set KALSHI_API_KEY.")
+        raise RuntimeError("Missing Kalshi API key; set KALSHI_ACCESS_KEY (or KALSHI_API_KEY).")
     if not config.kalshi_private_key_path:
         raise RuntimeError("Missing Kalshi private key; set KALSHI_PRIVATE_KEY_PATH.")
     try:

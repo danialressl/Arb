@@ -423,6 +423,7 @@ async def _loop_heartbeat(name: str, *, interval: float = 5.0, warn_threshold: f
 
 
 def _run_live(config, args) -> int:
+    _purge_db(config.db_path)
     init_db(config.db_path)
     if not args.polymarket and not args.kalshi:
         args.polymarket = True
@@ -444,6 +445,27 @@ def _run_live(config, args) -> int:
     except KeyboardInterrupt:
         logger.info("Live loop stopped")
     return 0
+
+
+def _purge_db(db_path: str) -> None:
+    if not db_path:
+        return
+    paths = [
+        db_path,
+        f"{db_path}-journal",
+        f"{db_path}-wal",
+        f"{db_path}-shm",
+    ]
+    removed = []
+    for path in paths:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+                removed.append(path)
+        except OSError as exc:
+            logger.warning("Failed to remove db file %s: %s", path, exc)
+    if removed:
+        logger.info("Purged db files: %s", ", ".join(removed))
 
 
 async def _run_live_loop(
