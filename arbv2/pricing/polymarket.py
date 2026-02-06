@@ -114,15 +114,13 @@ async def stream_books(config: Config, token_map: Dict[str, List[Tuple[Market, s
     orderbooks: Dict[str, Dict[str, Dict[float, float]]] = {}
     last_trade: Dict[str, Optional[float]] = {}
     backoff_seconds = 1
-
     while True:
         try:
-            async with websockets.connect(url) as ws:
+            async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                 await ws.send(json.dumps({"assets_ids": asset_ids, "type": "market"}))
                 logger.info("Polymarket WS subscribed assets=%d", len(asset_ids))
                 set_stream_health("polymarket", True)
                 backoff_seconds = 1
-                ping_task = asyncio.create_task(_ping(ws))
                 message_count = 0
                 try:
                     async for message in ws:
@@ -133,7 +131,7 @@ async def stream_books(config: Config, token_map: Dict[str, List[Tuple[Market, s
                         if snapshots:
                             insert_prices(db_path, snapshots)
                 finally:
-                    ping_task.cancel()
+                    pass
         except asyncio.CancelledError:
             logger.info("Polymarket WS stream cancelled")
             set_stream_health("polymarket", False)
@@ -339,12 +337,6 @@ def _best_bid_from_map(levels: Dict[float, float]) -> Optional[float]:
 
 def _best_ask_from_map(levels: Dict[float, float]) -> Optional[float]:
     return min(levels.keys()) if levels else None
-
-
-async def _ping(ws) -> None:
-    while True:
-        await asyncio.sleep(10)
-        await ws.send("PING")
 
 
 def _resolve_token_ids(market: Market) -> List[tuple]:

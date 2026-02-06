@@ -55,6 +55,8 @@ async def stream_books(
                 padding,
             )
             connect_kwargs = _ws_connect_kwargs(ws_headers)
+            connect_kwargs["ping_interval"] = 20
+            connect_kwargs["ping_timeout"] = 20
             async with websockets.connect(ws_url, **connect_kwargs) as ws:
                 params = {
                     "channels": ["orderbook_delta"],

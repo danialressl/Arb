@@ -324,6 +324,7 @@ async def _run_price_streams(
     if kalshi_markets:
         tasks.append(asyncio.create_task(stream_kalshi_books(config, kalshi_markets, config.db_path)))
     tasks.append(asyncio.create_task(_run_arb_stream(config)))
+    tasks.append(asyncio.create_task(_loop_heartbeat("price_streams")))
     if not tasks:
         return
     await asyncio.gather(*tasks)
@@ -358,6 +359,18 @@ async def _run_arb_stream(config) -> None:
         _scan_arb_events(config.db_path, events_event, ArbMode.EVENT_OUTCOME, title_by_market_id)
         _scan_arb_events(config.db_path, events_binary, ArbMode.BINARY_MIRROR, title_by_market_id)
         await asyncio.sleep(2)
+
+
+async def _loop_heartbeat(name: str, *, interval: float = 5.0, warn_threshold: float = 1.0) -> None:
+    loop = asyncio.get_running_loop()
+    next_ts = loop.time() + interval
+    while True:
+        await asyncio.sleep(interval)
+        now = loop.time()
+        drift = now - next_ts
+        if drift > warn_threshold:
+            logger.warning("Event loop lag %s drift=%.3fs", name, drift)
+        next_ts = now + interval
 
 
 def _run_live(config, args) -> int:
