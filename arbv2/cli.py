@@ -38,6 +38,7 @@ from arbv2.pricing.arb import (
     find_best_arb,
     should_emit_signal,
 )
+from arbv2.persistence import observe as observe_persistence, end_run as end_persistence_run
 from arbv2.storage import (
     fetch_markets,
     fetch_match_pairs,
@@ -407,7 +408,7 @@ async def _run_arb_stream(config) -> None:
     while True:
         _scan_arb_events(config.db_path, events_event, ArbMode.EVENT_OUTCOME, title_by_market_id)
         _scan_arb_events(config.db_path, events_binary, ArbMode.BINARY_MIRROR, title_by_market_id)
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.5)
 
 
 async def _loop_heartbeat(name: str, *, interval: float = 5.0, warn_threshold: float = 1.0) -> None:
@@ -546,6 +547,7 @@ def _scan_arb_events(
             continue
         if not should_emit_signal(event, mode, signal):
             continue
+        observe_persistence(signal, now_utc=datetime.now(timezone.utc), scan_interval_ms=500)
         detected_ts = int(time.time() * 1000)
         signal["detected_ts"] = detected_ts
         logger.info(
@@ -572,6 +574,7 @@ def _scan_arb_events(
                     "confirm_on_trigger",
                     "arbv2_confirm_rejections.csv",
                 )
+                end_persistence_run(signal, now_utc=datetime.now(timezone.utc), scan_interval_ms=500)
                 continue
             post_decision = post_confirm_decision(event, mode, signal, decision)
             if not post_decision["ok"]:
@@ -582,6 +585,7 @@ def _scan_arb_events(
                     "post_confirm",
                     "arbv2_confirm_rejections.csv",
                 )
+                end_persistence_run(signal, now_utc=datetime.now(timezone.utc), scan_interval_ms=500)
                 continue
             intent = _build_execution_intent(signal, post_decision)
             logger.info("EXECUTION_INTENT %s", json.dumps(intent, separators=(",", ":")))
@@ -790,7 +794,7 @@ def _log_match_stats(
         len(poly_keys),
         len(matched_keys),
     )
-    logger.info(
+    logger.debug(
         "Outcome label counts: kalshi=%s polymarket=%s",
         _count_outcomes(kalshi_markets),
         _count_outcomes(poly_markets),
@@ -804,7 +808,7 @@ def _log_match_stats(
         kpred = pred_by_id.get(k.market_id)
         team_a = canonicalize_team(kpred.team_a) if kpred else None
         team_b = canonicalize_team(kpred.team_b) if kpred else None
-        logger.info(
+        logger.debug(
             "Matched pair: %s | %s vs %s | %s | %s | %s",
             k.event_date,
             team_a,

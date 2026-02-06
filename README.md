@@ -34,3 +34,7 @@ python -m arbv2 match
 python -m arbv2 price --stream
 python -m arbv2 live
 ```
+
+## Persistence telemetry (measurement only)
+
+When enabled by default, the scanner appends lifetime telemetry for profitable opportunities to `arbv2_persistence.csv`. A lifetime starts when an opportunity first meets the minimum edge threshold and ends when its edge falls to break-even (<= 0). This is measurement-only and does not affect signals.

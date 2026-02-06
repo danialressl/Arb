@@ -114,7 +114,7 @@ def ingest_kalshi(config: Config) -> List[Market]:
             cursor = data.get("cursor")
             if not cursor:
                 break
-        logger.info("Kalshi markets fetched series=%s count=%d", series_ticker, series_count)
+        logger.debug("Kalshi markets fetched series=%s count=%d", series_ticker, series_count)
         if _limit_reached(config.ingest_limit, len(markets)):
             break
     logger.info("Kalshi markets kept total=%d", len(markets))
