@@ -92,7 +92,7 @@ def ingest_kalshi(config: Config) -> List[Market]:
                 if league_hint:
                     raw_market["series_league"] = league_hint
                 if _title_looks_wrong(str(title)):
-                    logger.error("Kalshi market title looks like outcome text: %s", title)
+                    logger.debug("Kalshi market title looks like outcome text: %s", title)
                 markets.append(
                     Market(
                         venue="kalshi",

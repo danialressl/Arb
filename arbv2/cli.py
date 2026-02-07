@@ -115,6 +115,17 @@ def main() -> int:
         help="Seconds between ingest+match refreshes",
     )
     live_parser.add_argument("--poll-seconds", type=int, default=1, help="Kalshi poll cadence in seconds")
+    live_parser.add_argument(
+        "--start-at",
+        choices=["ingest", "match", "price"],
+        default="ingest",
+        help="Only for the first cycle: start live loop at this stage and skip earlier stages",
+    )
+    live_parser.add_argument(
+        "--no-purge-db",
+        action="store_true",
+        help="Do not delete the existing database before starting live",
+    )
 
     args = parser.parse_args()
     config = load_config()
@@ -425,7 +436,8 @@ async def _loop_heartbeat(name: str, *, interval: float = 5.0, warn_threshold: f
 
 
 def _run_live(config, args) -> int:
-    _purge_db(config.db_path)
+    if not args.no_purge_db:
+        _purge_db(config.db_path)
     init_db(config.db_path)
     if not args.polymarket and not args.kalshi:
         args.polymarket = True
@@ -442,6 +454,7 @@ def _run_live(config, args) -> int:
                 interval_seconds=args.interval_seconds,
                 poll_seconds=args.poll_seconds,
                 limit=args.limit,
+                start_at=args.start_at,
             )
         )
     except KeyboardInterrupt:
@@ -478,13 +491,22 @@ async def _run_live_loop(
     interval_seconds: int,
     poll_seconds: int,
     limit: Optional[int],
+    start_at: str,
 ) -> None:
     cycle = 0
     while True:
         cycle += 1
-        logger.info("Live cycle %d: ingest+match", cycle)
-        _run_ingest(config, True, True)
-        _run_match(config)
+        if cycle == 1:
+            run_ingest = start_at == "ingest"
+            run_match = start_at in {"ingest", "match"}
+        else:
+            run_ingest = True
+            run_match = True
+        logger.info("Live cycle %d: ingest=%s match=%s", cycle, run_ingest, run_match)
+        if run_ingest:
+            _run_ingest(config, True, True)
+        if run_match:
+            _run_match(config)
         poly_token_map, kalshi_markets = _build_price_targets(
             config,
             enable_polymarket=enable_polymarket,

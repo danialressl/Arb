@@ -35,6 +35,16 @@ python -m arbv2 price --stream
 python -m arbv2 live
 ```
 
+Live loop options (examples):
+
+```bash
+# Keep existing DB and start directly at price streaming (first cycle only)
+python -m arbv2 live --no-purge-db --start-at price
+
+# Skip ingest but re-run match each cycle after the first
+python -m arbv2 live --no-purge-db --start-at match
+```
+
 ## Persistence telemetry (measurement only)
 
 Persistence is tracked only for execution intents. Once an execution intent is emitted, the scanner monitors the same signal until its recomputed edge drops to break-even (<= 0). The duration is written back into `arbv2_execution_intents.csv` as `signal_duration_ms`, and `confirmation_time_ms` is recorded as `confirmed_at_ts - detected_ts`. This is measurement-only and does not affect signals.
