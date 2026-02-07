@@ -2,6 +2,7 @@ import time
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from arbv2.pricing import arb as arb_module
 from arbv2.pricing.arb import ArbMode, EventMarkets, ORDERBOOKS, post_confirm_decision, update_orderbook
@@ -12,17 +13,25 @@ class PostConfirmGateTests(unittest.TestCase):
         self._old_enabled = arb_module.POST_CONFIRM_ENABLED
         self._old_window = arb_module.POST_CONFIRM_WINDOW_MS
         self._old_decay = arb_module.POST_CONFIRM_MAX_EDGE_DECAY_BPS
+        self._old_rest_enabled = arb_module.POST_CONFIRM_REST_FALLBACK_ENABLED
+        self._old_rest_cooldown = arb_module.POST_CONFIRM_REST_FALLBACK_COOLDOWN_SECONDS
         arb_module.POST_CONFIRM_ENABLED = True
         arb_module.POST_CONFIRM_WINDOW_MS = 400
         arb_module.POST_CONFIRM_MAX_EDGE_DECAY_BPS = 30
+        arb_module.POST_CONFIRM_REST_FALLBACK_ENABLED = True
+        arb_module.POST_CONFIRM_REST_FALLBACK_COOLDOWN_SECONDS = 0
         arb_module.POST_CONFIRM_CACHE.clear()
+        arb_module.POST_CONFIRM_REST_COOLDOWN.clear()
         ORDERBOOKS.clear()
 
     def tearDown(self) -> None:
         arb_module.POST_CONFIRM_ENABLED = self._old_enabled
         arb_module.POST_CONFIRM_WINDOW_MS = self._old_window
         arb_module.POST_CONFIRM_MAX_EDGE_DECAY_BPS = self._old_decay
+        arb_module.POST_CONFIRM_REST_FALLBACK_ENABLED = self._old_rest_enabled
+        arb_module.POST_CONFIRM_REST_FALLBACK_COOLDOWN_SECONDS = self._old_rest_cooldown
         arb_module.POST_CONFIRM_CACHE.clear()
+        arb_module.POST_CONFIRM_REST_COOLDOWN.clear()
 
     def _event(self) -> EventMarkets:
         return EventMarkets(
@@ -113,3 +122,25 @@ class PostConfirmGateTests(unittest.TestCase):
         with patch.object(arb_module.time, "time", return_value=2.0):
             result = post_confirm_decision(event, ArbMode.EVENT_OUTCOME, signal_b, decision, now_ms=1100)
         self.assertFalse(result["ok"])
+
+    def test_rest_fallback_recovers_sync_skew(self) -> None:
+        event = self._event()
+        signal = self._signal("KALSHI:A + POLY:B")
+        decision = {"recalculated_edge_bps": 100.0}
+        kalshi_now = datetime(2026, 1, 1, 0, 0, 10, tzinfo=timezone.utc)
+        poly_old = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+        update_orderbook("kalshi", "K-A", "A", bids=[], asks=[(0.4, 500)], last_update_ts_utc=kalshi_now)
+        update_orderbook("polymarket", "P-B", "B", bids=[], asks=[(0.5, 500)], last_update_ts_utc=poly_old)
+        signal["detected_ts"] = 1000
+        dummy_config = SimpleNamespace(http_timeout_seconds=1.0)
+
+        def refresh_stub(config, sig, lagging_venue):
+            self.assertEqual(lagging_venue, "polymarket")
+            update_orderbook("polymarket", "P-B", "B", bids=[], asks=[(0.5, 500)], last_update_ts_utc=kalshi_now)
+            return True
+
+        with patch.object(arb_module, "_refresh_lagging_books_once", side_effect=refresh_stub):
+            result = post_confirm_decision(event, ArbMode.EVENT_OUTCOME, signal, decision, now_ms=1000, config=dummy_config)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "first_confirm_cached")

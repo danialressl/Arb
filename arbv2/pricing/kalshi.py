@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import requests
+
 from arbv2.config import Config
 from arbv2.models import Market, PriceSnapshot
 from arbv2.pricing.arb import set_stream_health, update_orderbook
@@ -13,6 +15,34 @@ from arbv2.storage import insert_prices
 
 
 logger = logging.getLogger(__name__)
+
+
+def fetch_book_snapshot(
+    config: Config,
+    market_ticker: str,
+    *,
+    outcome_label: Optional[str] = None,
+) -> List[PriceSnapshot]:
+    url = config.kalshi_base_url.rstrip("/") + f"/markets/{market_ticker}/orderbook"
+    try:
+        resp = requests.get(url, timeout=config.http_timeout_seconds)
+    except requests.RequestException as exc:
+        logger.warning("Kalshi REST orderbook request failed market=%s err=%s", market_ticker, exc)
+        return []
+    if resp.status_code != 200:
+        logger.warning("Kalshi REST orderbook error market=%s status=%s", market_ticker, resp.status_code)
+        return []
+    try:
+        data = resp.json()
+    except json.JSONDecodeError:
+        logger.warning("Kalshi REST orderbook response not JSON market=%s", market_ticker)
+        return []
+    orderbook = data.get("orderbook") or {}
+    yes_levels = _levels_from_snapshot(orderbook.get("yes_dollars") or [])
+    no_levels = _levels_from_snapshot(orderbook.get("no_dollars") or [])
+    ts_dt = datetime.now(timezone.utc)
+    _publish_books(market_ticker, outcome_label, yes_levels, no_levels, ts_dt)
+    return _build_snapshot_rows(market_ticker, outcome_label, yes_levels, no_levels, ts_dt)
 
 
 async def stream_books(

@@ -40,6 +40,11 @@ POST_CONFIRM_ENABLED = os.getenv("ARBV2_POST_CONFIRM_ENABLED", "true") == "true"
 POST_CONFIRM_WINDOW_MS = int(os.getenv("ARBV2_POST_CONFIRM_WINDOW_MS", "6000"))
 POST_CONFIRM_MAX_EDGE_DECAY_BPS = int(os.getenv("ARBV2_POST_CONFIRM_MAX_EDGE_DECAY_BPS", "50"))
 POST_CONFIRM_MAX_SYNC_SKEW_SECONDS = float(os.getenv("ARBV2_MAX_SYNC_SKEW_SECONDS", "3"))
+POST_CONFIRM_REST_FALLBACK_ENABLED = os.getenv("ARBV2_POST_CONFIRM_REST_FALLBACK_ENABLED", "true") == "true"
+POST_CONFIRM_REST_FALLBACK_TIMEOUT_SECONDS = float(os.getenv("ARBV2_POST_CONFIRM_REST_FALLBACK_TIMEOUT_SECONDS", "0.5"))
+POST_CONFIRM_REST_FALLBACK_COOLDOWN_SECONDS = float(
+    os.getenv("ARBV2_POST_CONFIRM_REST_FALLBACK_COOLDOWN_SECONDS", "2")
+)
 
 STREAM_HEALTH: Dict[str, bool] = {"polymarket": False, "kalshi": False}
 
@@ -119,6 +124,14 @@ class SignalSuppressor:
 SIGNAL_SUPPRESSOR = SignalSuppressor()
 CONFIRM_IDEMPOTENCY: Dict[str, int] = {}
 POST_CONFIRM_CACHE: Dict[str, Dict[str, float]] = {}
+POST_CONFIRM_REST_COOLDOWN: Dict[Tuple[str, str], float] = {}
+
+_POST_CONFIRM_REST_REASONS = {
+    "sync_skew_exceeded",
+    "stale_book",
+    "missing_book",
+    "missing_fetched_at",
+}
 
 
 def update_orderbook(
@@ -1378,6 +1391,8 @@ def post_confirm_decision(
     decision: Dict[str, object],
     *,
     now_ms: Optional[int] = None,
+    config: Optional[object] = None,
+    _allow_rest_fallback: bool = True,
 ) -> Dict[str, object]:
     if not POST_CONFIRM_ENABLED:
         return {"ok": True, "reason": "disabled"}
@@ -1488,6 +1503,34 @@ def post_confirm_decision(
     edge_decay_out = edge_decay_detected if edge_decay_detected is not None else edge_decay
 
     if reasons:
+        fallback_attempted = False
+        fallback_venue = None
+        fallback_result = None
+        if (
+            _allow_rest_fallback
+            and config is not None
+            and POST_CONFIRM_REST_FALLBACK_ENABLED
+            and _should_try_post_confirm_rest_fallback(reasons)
+        ):
+            fallback_attempted = True
+            lagging_venue = _lagging_venue_for_post_confirm(kalshi_ts, polymarket_ts)
+            fallback_venue = lagging_venue
+            if lagging_venue and _refresh_lagging_books_once(config, signal, lagging_venue):
+                retry = post_confirm_decision(
+                    event,
+                    arb_type,
+                    signal,
+                    decision,
+                    now_ms=now_ms,
+                    config=config,
+                    _allow_rest_fallback=False,
+                )
+                if isinstance(retry, dict):
+                    retry["rest_fallback_attempted"] = True
+                    retry["rest_fallback_venue"] = lagging_venue
+                    retry["rest_fallback_result"] = "refreshed_recomputed"
+                return retry
+            fallback_result = "refresh_failed_or_skipped"
         return {
             "ok": False,
             "reason": ",".join(sorted(set(reasons))),
@@ -1500,6 +1543,9 @@ def post_confirm_decision(
             "sync_skew_seconds": sync_skew_seconds,
             "kalshi_book_ts_utc": kalshi_ts_utc,
             "polymarket_book_ts_utc": polymarket_ts_utc,
+            "rest_fallback_attempted": fallback_attempted,
+            "rest_fallback_venue": fallback_venue,
+            "rest_fallback_result": fallback_result,
         }
 
     if not prev:
@@ -1565,6 +1611,97 @@ def post_confirm_decision(
         "kalshi_book_ts_utc": kalshi_ts_utc,
         "polymarket_book_ts_utc": polymarket_ts_utc,
     }
+
+
+def _should_try_post_confirm_rest_fallback(reasons: List[str]) -> bool:
+    unique = set(reasons)
+    return bool(unique) and unique.issubset(_POST_CONFIRM_REST_REASONS)
+
+
+def _lagging_venue_for_post_confirm(
+    kalshi_ts: Optional[float],
+    polymarket_ts: Optional[float],
+) -> Optional[str]:
+    if kalshi_ts is None and polymarket_ts is None:
+        return None
+    if kalshi_ts is None:
+        return "kalshi"
+    if polymarket_ts is None:
+        return "polymarket"
+    if kalshi_ts == polymarket_ts:
+        return None
+    return "kalshi" if kalshi_ts < polymarket_ts else "polymarket"
+
+
+def _refresh_lagging_books_once(config: object, signal: Dict[str, object], lagging_venue: str) -> bool:
+    refreshed = False
+    now_ts = time.time()
+    legs = signal.get("legs") or []
+    for leg in legs:
+        venue = str(leg.get("venue") or "")
+        if venue != lagging_venue:
+            continue
+        market_id = str(leg.get("market_id") or "")
+        if not market_id:
+            continue
+        cooldown_key = (venue, market_id)
+        last_ts = POST_CONFIRM_REST_COOLDOWN.get(cooldown_key)
+        if last_ts is not None and (now_ts - last_ts) < POST_CONFIRM_REST_FALLBACK_COOLDOWN_SECONDS:
+            continue
+        POST_CONFIRM_REST_COOLDOWN[cooldown_key] = now_ts
+        if venue == "polymarket":
+            try:
+                from arbv2.models import Market
+                from arbv2.pricing.polymarket import fetch_book_snapshot as fetch_poly_book_snapshot
+            except Exception as exc:
+                logger.debug("post-confirm fallback import failed for polymarket: %s", exc)
+                continue
+            outcome_label = str(leg.get("outcome_label") or "")
+            event_id = str(signal.get("event_id") or market_id)
+            market = Market(
+                venue="polymarket",
+                market_id=market_id,
+                event_id=event_id,
+                title=market_id,
+                event_title=event_id,
+                raw_json={},
+                outcome_label=outcome_label or None,
+            )
+            snapshots = _fetch_with_timeout_override(
+                config,
+                lambda: fetch_poly_book_snapshot(config, market_id, [(market, outcome_label)]),
+            )
+            if snapshots:
+                refreshed = True
+        elif venue == "kalshi":
+            try:
+                from arbv2.pricing.kalshi import fetch_book_snapshot as fetch_kalshi_book_snapshot
+            except Exception as exc:
+                logger.debug("post-confirm fallback import failed for kalshi: %s", exc)
+                continue
+            outcome_label = str(leg.get("outcome_label") or "")
+            snapshots = _fetch_with_timeout_override(
+                config,
+                lambda: fetch_kalshi_book_snapshot(config, market_id, outcome_label=outcome_label),
+            )
+            if snapshots:
+                refreshed = True
+    return refreshed
+
+
+def _fetch_with_timeout_override(config: object, fetch_fn):
+    old_timeout = getattr(config, "http_timeout_seconds", None)
+    try:
+        if old_timeout is not None:
+            timeout_seconds = min(float(old_timeout), POST_CONFIRM_REST_FALLBACK_TIMEOUT_SECONDS)
+            setattr(config, "http_timeout_seconds", timeout_seconds)
+        return fetch_fn()
+    except Exception as exc:
+        logger.debug("post-confirm fallback fetch failed: %s", exc)
+        return []
+    finally:
+        if old_timeout is not None:
+            setattr(config, "http_timeout_seconds", old_timeout)
 
 
 def confirm_on_trigger(opportunity: Dict[str, object]) -> Dict[str, object]:

@@ -418,8 +418,8 @@ async def _run_arb_stream(config) -> None:
     events_event = _build_event_markets(kalshi_markets, poly_markets, kalshi_preds, poly_preds)
     events_binary = _build_binary_events(config.db_path)
     while True:
-        _scan_arb_events(config.db_path, events_event, ArbMode.EVENT_OUTCOME, title_by_market_id)
-        _scan_arb_events(config.db_path, events_binary, ArbMode.BINARY_MIRROR, title_by_market_id)
+        _scan_arb_events(config, config.db_path, events_event, ArbMode.EVENT_OUTCOME, title_by_market_id)
+        _scan_arb_events(config, config.db_path, events_binary, ArbMode.BINARY_MIRROR, title_by_market_id)
         await asyncio.sleep(0.5)
 
 
@@ -533,6 +533,7 @@ async def _run_live_loop(
 
 
 def _scan_arb_events(
+    config,
     db_path: str,
     events: List[EventMarkets],
     mode: ArbMode,
@@ -611,7 +612,21 @@ def _scan_arb_events(
                     "arbv2_confirm_rejections.csv",
                 )
                 continue
-            post_decision = post_confirm_decision(event, mode, signal, decision)
+            post_decision = post_confirm_decision(event, mode, signal, decision, config=config)
+            fallback_attempted = bool(post_decision.get("rest_fallback_attempted", False))
+            fallback_venue = post_decision.get("rest_fallback_venue") or ""
+            fallback_result = post_decision.get("rest_fallback_result") or ("not_attempted" if not fallback_attempted else "unknown")
+            logger.info(
+                "ARB post-confirm %s reason=%s edge_bps=%.2f expected_pnl=%.4f sync_skew_s=%.3f fallback_attempted=%s fallback_venue=%s fallback_result=%s",
+                "PASS" if post_decision.get("ok") else "FAIL",
+                post_decision.get("reason") or "",
+                post_decision.get("edge_bps") or 0.0,
+                post_decision.get("expected_pnl_usd") or 0.0,
+                post_decision.get("sync_skew_seconds") or 0.0,
+                fallback_attempted,
+                fallback_venue,
+                fallback_result,
+            )
             if not post_decision["ok"]:
                 _append_confirm_rejection_csv(
                     signal,
