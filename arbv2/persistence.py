@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
-from dataclasses import dataclass, field
+import os
+import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -16,7 +17,9 @@ class PersistenceRun:
     arb_type: str
     direction: str
     event_key: str
-    legs_json: str
+    legs: List[Dict[str, object]]
+    detected_ts_ms: int
+    confirmed_at_ts: Optional[int]
     first_seen_ts_utc: datetime
     last_seen_ts_utc: datetime
     ticks_alive: int
@@ -24,20 +27,25 @@ class PersistenceRun:
     max_edge_bps: float
     min_edge_bps: float
     last_edge_bps: float
-    edge_series: List[Tuple[str, float]] = field(default_factory=list)
     last_expected_pnl_usd: float = 0.0
     last_size: float = 0.0
+    saw_execution_intent: bool = False
+    missed_updates: int = 0
 
 
 ACTIVE_RUNS: Dict[str, PersistenceRun] = {}
+RUNS_BY_EVENT: Dict[str, set[str]] = {}
 
 
 def _now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _min_edge_bps() -> float:
-    return float(getattr(arb_module, "MIN_EDGE_BPS", 0))
+def _max_missed_ticks() -> int:
+    try:
+        return max(1, int(os.getenv("ARBV2_PERSISTENCE_MISS_TICKS", "6")))
+    except ValueError:
+        return 6
 
 
 def _leg_tuple(leg: Dict[str, object]) -> Tuple[str, str, str, str]:
@@ -49,7 +57,7 @@ def _leg_tuple(leg: Dict[str, object]) -> Tuple[str, str, str, str]:
     )
 
 
-def _fingerprint(signal: Dict[str, object]) -> Tuple[str, str]:
+def _fingerprint(signal: Dict[str, object]) -> Tuple[str, List[Dict[str, object]]]:
     arb_type = str(signal.get("arb_type") or "")
     direction = str(signal.get("direction") or "")
     event_key = str(signal.get("event_id") or "")
@@ -63,123 +71,114 @@ def _fingerprint(signal: Dict[str, object]) -> Tuple[str, str]:
     }
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-    return digest, json.dumps(leg_tuples, separators=(",", ":"))
-
-
-def _append_persistence_csv(row: Dict[str, object], csv_path: str) -> None:
-    fieldnames = [
-        "ts_utc_emitted",
-        "fingerprint",
-        "arb_type",
-        "direction",
-        "event_key",
-        "legs_json",
-        "first_seen_ts_utc",
-        "last_seen_ts_utc",
-        "duration_ms",
-        "ticks_alive",
-        "scan_interval_ms",
-        "entry_edge_bps",
-        "max_edge_bps",
-        "min_edge_bps",
-        "last_edge_bps",
-        "last_expected_pnl_usd",
-        "last_size",
-        "edge_series_json",
+    leg_dicts = [
+        {
+            "venue": venue,
+            "market_id": market_id,
+            "outcome_label": outcome_label,
+            "side": side,
+        }
+        for venue, market_id, outcome_label, side in leg_tuples
     ]
-    write_header = False
-    try:
-        with open(csv_path, "r", encoding="utf-8") as handle:
-            existing = handle.read(1)
-            if not existing:
-                write_header = True
-    except FileNotFoundError:
-        write_header = True
-    with open(csv_path, "a", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    return digest, leg_dicts
 
 
-def observe(
-    signal: Optional[Dict[str, object]],
+def observe_event(
+    event: arb_module.EventMarkets,
+    arb_mode: arb_module.ArbMode,
     *,
     now_utc: Optional[datetime] = None,
     scan_interval_ms: int = 500,
-    csv_path: str = "arbv2_persistence.csv",
-) -> None:
-    if signal is None:
-        return
+) -> List[Dict[str, object]]:
     if now_utc is None:
         now_utc = _now_utc()
-    edge_bps = float(arb_module.signal_edge_bps(signal))
-    min_edge = _min_edge_bps()
-    fingerprint, legs_json = _fingerprint(signal)
-    run = ACTIVE_RUNS.get(fingerprint)
-    ts_iso = now_utc.isoformat()
-    expected_pnl = float(signal.get("profit") or 0.0)
-    size = float(signal.get("size") or 0.0)
-
-    if edge_bps >= min_edge:
+    event_key = str(event.event_id or "")
+    run_ids = list(RUNS_BY_EVENT.get(event_key, set()))
+    if not run_ids:
+        return []
+    results: List[Dict[str, object]] = []
+    for run_id in run_ids:
+        run = ACTIVE_RUNS.get(run_id)
         if run is None:
-            run = PersistenceRun(
-                fingerprint=fingerprint,
-                arb_type=str(signal.get("arb_type") or ""),
-                direction=str(signal.get("direction") or ""),
-                event_key=str(signal.get("event_id") or ""),
-                legs_json=legs_json,
-                first_seen_ts_utc=now_utc,
-                last_seen_ts_utc=now_utc,
-                ticks_alive=1,
-                entry_edge_bps=edge_bps,
-                max_edge_bps=edge_bps,
-                min_edge_bps=edge_bps,
-                last_edge_bps=edge_bps,
-                edge_series=[(ts_iso, edge_bps)],
-                last_expected_pnl_usd=expected_pnl,
-                last_size=size,
+            continue
+        if run.arb_type != arb_mode.value:
+            continue
+        update = _compute_edge_for_run(run, now_utc)
+        if update is None:
+            run.missed_updates += 1
+            if run.missed_updates >= _max_missed_ticks():
+                _remove_run(run)
+            continue
+        edge_bps, expected_pnl = update
+        run.missed_updates = 0
+        _update_run(run, now_utc, edge_bps, expected_pnl, run.last_size or 0.0)
+        if edge_bps > 0:
+            continue
+        duration_ms = int(now_utc.timestamp() * 1000) - run.detected_ts_ms
+        _remove_run(run)
+        if run.saw_execution_intent and run.confirmed_at_ts is not None:
+            results.append(
+                {
+                    "duration_ms": duration_ms,
+                    "event_id": run.event_key,
+                    "confirmed_at_ts": run.confirmed_at_ts,
+                }
             )
-            ACTIVE_RUNS[fingerprint] = run
-            return
-        _update_run(run, now_utc, edge_bps, expected_pnl, size, ts_iso)
-        return
-
-    if edge_bps > 0:
-        if run is None:
-            return
-        _update_run(run, now_utc, edge_bps, expected_pnl, size, ts_iso)
-        return
-
-    if run is None:
-        return
-    _update_run(run, now_utc, edge_bps, expected_pnl, size, ts_iso)
-    _finalize_run(run, scan_interval_ms, csv_path)
-    ACTIVE_RUNS.pop(fingerprint, None)
+    return results
 
 
-def end_run(
-    signal: Optional[Dict[str, object]],
-    *,
-    now_utc: Optional[datetime] = None,
-    scan_interval_ms: int = 500,
-    csv_path: str = "arbv2_persistence.csv",
-) -> None:
+def drop_run(signal: Optional[Dict[str, object]]) -> None:
     if signal is None:
-        return
-    if now_utc is None:
-        now_utc = _now_utc()
+        return None
     fingerprint, _ = _fingerprint(signal)
     run = ACTIVE_RUNS.get(fingerprint)
+    if run:
+        _remove_run(run)
+    return None
+
+
+def mark_execution_intent(signal: Optional[Dict[str, object]], confirmed_at_ts: Optional[int] = None) -> None:
+    if signal is None:
+        return None
+    fingerprint, legs = _fingerprint(signal)
+    run = ACTIVE_RUNS.get(fingerprint)
+    detected_ts = signal.get("detected_ts")
+    try:
+        detected_ts_ms = int(detected_ts)
+    except (TypeError, ValueError):
+        detected_ts_ms = int(time.time() * 1000)
     if run is None:
-        return
-    edge_bps = float(arb_module.signal_edge_bps(signal))
-    expected_pnl = float(signal.get("profit") or 0.0)
-    size = float(signal.get("size") or 0.0)
-    ts_iso = now_utc.isoformat()
-    _update_run(run, now_utc, edge_bps, expected_pnl, size, ts_iso)
-    _finalize_run(run, scan_interval_ms, csv_path)
-    ACTIVE_RUNS.pop(fingerprint, None)
+        start_utc = datetime.fromtimestamp(detected_ts_ms / 1000, tz=timezone.utc)
+        edge_bps = float(arb_module.signal_edge_bps(signal))
+        expected_pnl = float(signal.get("profit") or 0.0)
+        size = float(signal.get("size") or 0.0)
+        run = PersistenceRun(
+            fingerprint=fingerprint,
+            arb_type=str(signal.get("arb_type") or ""),
+            direction=str(signal.get("direction") or ""),
+            event_key=str(signal.get("event_id") or ""),
+            legs=legs,
+            detected_ts_ms=detected_ts_ms,
+            confirmed_at_ts=confirmed_at_ts,
+            first_seen_ts_utc=start_utc,
+            last_seen_ts_utc=start_utc,
+            ticks_alive=1,
+            entry_edge_bps=edge_bps,
+            max_edge_bps=edge_bps,
+            min_edge_bps=edge_bps,
+            last_edge_bps=edge_bps,
+            last_expected_pnl_usd=expected_pnl,
+            last_size=size,
+            saw_execution_intent=True,
+            missed_updates=0,
+        )
+        ACTIVE_RUNS[fingerprint] = run
+        RUNS_BY_EVENT.setdefault(run.event_key, set()).add(fingerprint)
+        return None
+    run.saw_execution_intent = True
+    if confirmed_at_ts is not None:
+        run.confirmed_at_ts = confirmed_at_ts
+    return None
 
 
 def _update_run(
@@ -188,38 +187,49 @@ def _update_run(
     edge_bps: float,
     expected_pnl: float,
     size: float,
-    ts_iso: str,
 ) -> None:
     run.last_seen_ts_utc = now_utc
     run.ticks_alive += 1
     run.max_edge_bps = max(run.max_edge_bps, edge_bps)
     run.min_edge_bps = min(run.min_edge_bps, edge_bps)
     run.last_edge_bps = edge_bps
-    run.edge_series.append((ts_iso, edge_bps))
     run.last_expected_pnl_usd = expected_pnl
     run.last_size = size
 
 
-def _finalize_run(run: PersistenceRun, scan_interval_ms: int, csv_path: str) -> None:
-    duration_ms = int((run.last_seen_ts_utc - run.first_seen_ts_utc).total_seconds() * 1000)
-    row = {
-        "ts_utc_emitted": _now_utc().isoformat(),
-        "fingerprint": run.fingerprint,
-        "arb_type": run.arb_type,
-        "direction": run.direction,
-        "event_key": run.event_key,
-        "legs_json": run.legs_json,
-        "first_seen_ts_utc": run.first_seen_ts_utc.isoformat(),
-        "last_seen_ts_utc": run.last_seen_ts_utc.isoformat(),
-        "duration_ms": duration_ms,
-        "ticks_alive": run.ticks_alive,
-        "scan_interval_ms": scan_interval_ms,
-        "entry_edge_bps": run.entry_edge_bps,
-        "max_edge_bps": run.max_edge_bps,
-        "min_edge_bps": run.min_edge_bps,
-        "last_edge_bps": run.last_edge_bps,
-        "last_expected_pnl_usd": run.last_expected_pnl_usd,
-        "last_size": run.last_size,
-        "edge_series_json": json.dumps(run.edge_series, separators=(",", ":")),
-    }
-    _append_persistence_csv(row, csv_path)
+def _remove_run(run: PersistenceRun) -> None:
+    ACTIVE_RUNS.pop(run.fingerprint, None)
+    event_runs = RUNS_BY_EVENT.get(run.event_key)
+    if event_runs:
+        event_runs.discard(run.fingerprint)
+        if not event_runs:
+            RUNS_BY_EVENT.pop(run.event_key, None)
+
+
+def _compute_edge_for_run(run: PersistenceRun, now_utc: datetime) -> Optional[Tuple[float, float]]:
+    size = float(run.last_size or 0.0)
+    if size <= 0:
+        return None
+    keys = [(leg.get("venue"), leg.get("market_id"), leg.get("outcome_label")) for leg in run.legs]
+    if not arb_module._books_fresh_by_venue(keys):
+        return None
+    if not arb_module._books_fresh(keys, now_utc):
+        return None
+    eff_prices: List[float] = []
+    for leg in run.legs:
+        venue = str(leg.get("venue") or "")
+        market_id = str(leg.get("market_id") or "")
+        outcome_label = str(leg.get("outcome_label") or "")
+        side = str(leg.get("side") or "").upper() or "YES"
+        stats = arb_module.get_fill_stats(venue, market_id, outcome_label, side, size)
+        if not stats.get("ok"):
+            return None
+        vwap_price = stats.get("vwap_price")
+        eff = arb_module.apply_fees(venue, vwap_price, size)
+        if eff is None:
+            return None
+        eff_prices.append(float(eff))
+    total_price = sum(eff_prices)
+    profit = size * (1.0 - total_price)
+    edge_bps = (profit / size) * 10_000 if size > 0 else 0.0
+    return edge_bps, profit

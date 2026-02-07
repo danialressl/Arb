@@ -38,7 +38,8 @@ from arbv2.pricing.arb import (
     find_best_arb,
     should_emit_signal,
 )
-from arbv2.persistence import observe as observe_persistence, end_run as end_persistence_run
+from arbv2.persistence import observe_event as observe_persistence_event
+from arbv2.persistence import mark_execution_intent as mark_persistence_execution_intent
 from arbv2.storage import (
     fetch_markets,
     fetch_match_pairs,
@@ -515,9 +516,23 @@ def _scan_arb_events(
     mode: ArbMode,
     title_by_market_id: Dict[str, str],
 ) -> None:
+    now_utc = datetime.now(timezone.utc)
     scan_rows: List[tuple] = []
     latest_by_key: Dict[tuple, tuple] = {}
     for event in events:
+        persistence_results = observe_persistence_event(
+            event,
+            mode,
+            now_utc=now_utc,
+            scan_interval_ms=500,
+        )
+        for result in persistence_results:
+            _update_execution_intent_duration(
+                "arbv2_execution_intents.csv",
+                result.get("event_id"),
+                result.get("confirmed_at_ts"),
+                result.get("duration_ms"),
+            )
         metrics = evaluate_paired_metrics(event, mode)
         if metrics:
             legs = metrics.get("legs") or []
@@ -547,7 +562,6 @@ def _scan_arb_events(
             continue
         if not should_emit_signal(event, mode, signal):
             continue
-        observe_persistence(signal, now_utc=datetime.now(timezone.utc), scan_interval_ms=500)
         detected_ts = int(time.time() * 1000)
         signal["detected_ts"] = detected_ts
         logger.info(
@@ -574,7 +588,6 @@ def _scan_arb_events(
                     "confirm_on_trigger",
                     "arbv2_confirm_rejections.csv",
                 )
-                end_persistence_run(signal, now_utc=datetime.now(timezone.utc), scan_interval_ms=500)
                 continue
             post_decision = post_confirm_decision(event, mode, signal, decision)
             if not post_decision["ok"]:
@@ -585,9 +598,9 @@ def _scan_arb_events(
                     "post_confirm",
                     "arbv2_confirm_rejections.csv",
                 )
-                end_persistence_run(signal, now_utc=datetime.now(timezone.utc), scan_interval_ms=500)
                 continue
             intent = _build_execution_intent(signal, post_decision)
+            mark_persistence_execution_intent(signal, intent.get("confirmed_at_ts"))
             logger.info("EXECUTION_INTENT %s", json.dumps(intent, separators=(",", ":")))
             _append_execution_intent_csv(intent, "arbv2_execution_intents.csv")
             _log_signal_details(signal)
@@ -628,6 +641,14 @@ def _log_signal_details(signal: Dict[str, object]) -> None:
 
 def _build_execution_intent(signal: Dict[str, object], decision: Dict[str, object]) -> Dict[str, object]:
     legs = signal.get("legs") or []
+    confirmed_at_ts = int(time.time() * 1000)
+    detected_ts = signal.get("detected_ts")
+    confirmation_time_ms = None
+    try:
+        if detected_ts is not None:
+            confirmation_time_ms = confirmed_at_ts - int(detected_ts)
+    except (TypeError, ValueError):
+        confirmation_time_ms = None
     return {
         "type": "EXECUTION_INTENT",
         "event_id": signal.get("event_id"),
@@ -638,8 +659,44 @@ def _build_execution_intent(signal: Dict[str, object], decision: Dict[str, objec
         "size_usd": signal.get("size"),
         "edge_bps": decision.get("recalculated_edge_bps") or decision.get("edge_bps"),
         "expected_pnl_usd": decision.get("expected_pnl_usd"),
-        "confirmed_at_ts": int(time.time() * 1000),
+        "confirmed_at_ts": confirmed_at_ts,
+        "confirmation_time_ms": confirmation_time_ms,
+        "signal_duration_ms": None,
     }
+
+
+EXECUTION_INTENT_FIELDS = [
+    "type",
+    "event_id",
+    "venues",
+    "markets",
+    "sides",
+    "limit_prices",
+    "size_usd",
+    "edge_bps",
+    "expected_pnl_usd",
+    "confirmed_at_ts",
+    "confirmation_time_ms",
+    "signal_duration_ms",
+]
+
+
+def _ensure_execution_intent_header(csv_path: str) -> None:
+    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+        return
+    with open(csv_path, "r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        existing_fields = reader.fieldnames or []
+        if existing_fields == EXECUTION_INTENT_FIELDS:
+            return
+        rows = list(reader)
+    for row in rows:
+        for field in EXECUTION_INTENT_FIELDS:
+            row.setdefault(field, "")
+    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=EXECUTION_INTENT_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _append_execution_intent_csv(intent: Dict[str, object], csv_path: str) -> None:
@@ -654,13 +711,45 @@ def _append_execution_intent_csv(intent: Dict[str, object], csv_path: str) -> No
         "edge_bps": intent.get("edge_bps"),
         "expected_pnl_usd": intent.get("expected_pnl_usd"),
         "confirmed_at_ts": intent.get("confirmed_at_ts"),
+        "confirmation_time_ms": intent.get("confirmation_time_ms"),
+        "signal_duration_ms": intent.get("signal_duration_ms"),
     }
+    _ensure_execution_intent_header(csv_path)
     write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
     with open(csv_path, "a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
+        writer = csv.DictWriter(handle, fieldnames=EXECUTION_INTENT_FIELDS)
         if write_header:
             writer.writeheader()
         writer.writerow(row)
+
+
+def _update_execution_intent_duration(
+    csv_path: str,
+    event_id: Optional[str],
+    confirmed_at_ts: Optional[int],
+    duration_ms: Optional[int],
+) -> None:
+    if not event_id or confirmed_at_ts is None or duration_ms is None:
+        return
+    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+        return
+    _ensure_execution_intent_header(csv_path)
+    with open(csv_path, "r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+    updated = False
+    event_id_str = str(event_id)
+    confirmed_at_str = str(confirmed_at_ts)
+    for row in rows:
+        if row.get("event_id") == event_id_str and row.get("confirmed_at_ts") == confirmed_at_str:
+            row["signal_duration_ms"] = str(duration_ms)
+            updated = True
+    if not updated:
+        return
+    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=EXECUTION_INTENT_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def _append_confirm_rejection_csv(

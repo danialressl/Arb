@@ -37,4 +37,4 @@ python -m arbv2 live
 
 ## Persistence telemetry (measurement only)
 
-When enabled by default, the scanner appends lifetime telemetry for profitable opportunities to `arbv2_persistence.csv`. A lifetime starts when an opportunity first meets the minimum edge threshold and ends when its edge falls to break-even (<= 0). This is measurement-only and does not affect signals.
+Persistence is tracked only for execution intents. Once an execution intent is emitted, the scanner monitors the same signal until its recomputed edge drops to break-even (<= 0). The duration is written back into `arbv2_execution_intents.csv` as `signal_duration_ms`, and `confirmation_time_ms` is recorded as `confirmed_at_ts - detected_ts`. This is measurement-only and does not affect signals.
