@@ -1,28 +1,46 @@
-import time
+import copy
 import unittest
 from datetime import datetime, timezone
 from unittest.mock import patch
 
 from arbv2.pricing import arb as arb_module
-from arbv2.pricing.arb import ArbMode, EventMarkets, ORDERBOOKS, post_confirm_decision, update_orderbook
+from arbv2.pricing.arb import (
+    ArbMode,
+    EventMarkets,
+    ORDERBOOKS,
+    post_confirm_decision,
+    set_stream_connected,
+    set_stream_subscribed,
+    touch_stream_heartbeat,
+    update_orderbook,
+)
 
 
 class PostConfirmGateTests(unittest.TestCase):
     def setUp(self) -> None:
         self._old_enabled = arb_module.POST_CONFIRM_ENABLED
-        self._old_window = arb_module.POST_CONFIRM_WINDOW_MS
         self._old_decay = arb_module.POST_CONFIRM_MAX_EDGE_DECAY_BPS
+        self._old_stream_health = dict(arb_module.STREAM_HEALTH)
+        self._old_stream_status = copy.deepcopy(arb_module.STREAM_STATUS)
         arb_module.POST_CONFIRM_ENABLED = True
-        arb_module.POST_CONFIRM_WINDOW_MS = 400
         arb_module.POST_CONFIRM_MAX_EDGE_DECAY_BPS = 30
         arb_module.POST_CONFIRM_CACHE.clear()
         ORDERBOOKS.clear()
+        set_stream_connected("kalshi", True)
+        set_stream_subscribed("kalshi", True)
+        set_stream_connected("polymarket", True)
+        set_stream_subscribed("polymarket", True)
+        touch_stream_heartbeat("kalshi", ts=2.0)
+        touch_stream_heartbeat("polymarket", ts=2.0)
 
     def tearDown(self) -> None:
         arb_module.POST_CONFIRM_ENABLED = self._old_enabled
-        arb_module.POST_CONFIRM_WINDOW_MS = self._old_window
         arb_module.POST_CONFIRM_MAX_EDGE_DECAY_BPS = self._old_decay
         arb_module.POST_CONFIRM_CACHE.clear()
+        arb_module.STREAM_HEALTH.clear()
+        arb_module.STREAM_HEALTH.update(self._old_stream_health)
+        arb_module.STREAM_STATUS.clear()
+        arb_module.STREAM_STATUS.update(self._old_stream_status)
 
     def _event(self) -> EventMarkets:
         return EventMarkets(
@@ -62,7 +80,7 @@ class PostConfirmGateTests(unittest.TestCase):
             result = post_confirm_decision(event, ArbMode.EVENT_OUTCOME, signal, decision, now_ms=2200)
         self.assertTrue(result["ok"])
 
-    def test_second_confirm_outside_window(self) -> None:
+    def test_second_confirm_not_window_gated(self) -> None:
         event = self._event()
         signal = self._signal("KALSHI:A + POLY:B")
         decision = {"recalculated_edge_bps": 100.0}
@@ -75,7 +93,7 @@ class PostConfirmGateTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         with patch.object(arb_module.time, "time", return_value=2.0):
             result = post_confirm_decision(event, ArbMode.EVENT_OUTCOME, signal, decision, now_ms=2000)
-        self.assertFalse(result["ok"])
+        self.assertTrue(result["ok"])
 
     def test_edge_decay_rejects(self) -> None:
         event = self._event()
@@ -113,3 +131,18 @@ class PostConfirmGateTests(unittest.TestCase):
         with patch.object(arb_module.time, "time", return_value=2.0):
             result = post_confirm_decision(event, ArbMode.EVENT_OUTCOME, signal_b, decision, now_ms=1100)
         self.assertFalse(result["ok"])
+
+    def test_stream_unhealthy_rejects(self) -> None:
+        event = self._event()
+        signal = self._signal("KALSHI:A + POLY:B")
+        decision = {"recalculated_edge_bps": 100.0}
+        now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        with patch.object(arb_module.time, "time", return_value=2.0):
+            self._seed_books(now)
+        signal["detected_ts"] = 1000
+        set_stream_connected("kalshi", False)
+        with patch.object(arb_module.time, "time", return_value=2.0):
+            result = post_confirm_decision(event, ArbMode.EVENT_OUTCOME, signal, decision, now_ms=2000)
+        self.assertFalse(result["ok"])
+        self.assertIn("stream_unhealthy", result["reason"])
+        self.assertEqual(result["stream_reasons"]["kalshi"], "stream_disconnected")

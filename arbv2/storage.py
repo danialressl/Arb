@@ -2,7 +2,7 @@ import json
 import logging
 import re
 import sqlite3
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Iterable, List, Optional, Tuple
 
 from arbv2.models import Market, MatchResult, PriceSnapshot, SportsPredicate
@@ -231,14 +231,6 @@ def insert_arb_scans(db_path: str, rows: Iterable[tuple]) -> None:
         rows_list = list(rows)
         if not rows_list:
             return
-        cutoff = datetime.now(timezone.utc) - timedelta(minutes=2)
-        conn.execute(
-            """
-            DELETE FROM arb_scans
-            WHERE ts_utc IS NOT NULL AND ts_utc < ?
-            """,
-            (cutoff.isoformat(),),
-        )
         conn.executemany(
             """
             DELETE FROM arb_scans

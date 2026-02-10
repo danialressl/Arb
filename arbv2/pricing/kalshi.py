@@ -4,15 +4,24 @@ import json
 import logging
 from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from arbv2.config import Config
 from arbv2.models import Market, PriceSnapshot
-from arbv2.pricing.arb import set_stream_health, update_orderbook
+from arbv2.pricing.arb import (
+    record_stream_sequence,
+    set_stream_backlog_warning,
+    set_stream_connected,
+    set_stream_health,
+    set_stream_subscribed,
+    touch_stream_heartbeat,
+    update_orderbook,
+)
 from arbv2.storage import insert_prices
 
 
 logger = logging.getLogger(__name__)
+PRICE_WRITE_QUEUE_MAXSIZE = 1024
 
 
 async def stream_books(
@@ -40,16 +49,19 @@ async def stream_books(
     market_by_ticker = {m.market_id: m for m in markets}
     market_id_to_ticker: Dict[str, str] = {}
     levels_by_ticker: Dict[str, Dict[str, Dict[float, float]]] = {}
-    ws_url = config.kalshi_ws_url.rstrip("/")
+    ws_url = _normalize_kalshi_ws_url(config.kalshi_ws_url)
     tickers = list(market_by_ticker.keys())
     delta_count = 0
 
     while True:
+        heartbeat_task: Optional[asyncio.Task] = None
+        writer_task: Optional[asyncio.Task] = None
+        write_queue: Optional[asyncio.Queue] = None
         try:
             ws_headers = _kalshi_ws_headers(
                 config.kalshi_api_key,
                 config.kalshi_private_key_path,
-                config.kalshi_ws_url,
+                ws_url,
                 hashes,
                 serialization,
                 padding,
@@ -58,6 +70,9 @@ async def stream_books(
             connect_kwargs["ping_interval"] = 20
             connect_kwargs["ping_timeout"] = 20
             async with websockets.connect(ws_url, **connect_kwargs) as ws:
+                set_stream_connected("kalshi", True)
+                set_stream_subscribed("kalshi", False)
+                set_stream_backlog_warning("kalshi", False)
                 params = {
                     "channels": ["orderbook_delta"],
                     "send_initial_snapshot": True,
@@ -69,38 +84,66 @@ async def stream_books(
                 subscribe = {"id": 1, "cmd": "subscribe", "params": params}
                 await ws.send(json.dumps(subscribe))
                 logger.info("Kalshi WS connected and subscribed markets=%d", len(tickers))
+                set_stream_subscribed("kalshi", True)
+                touch_stream_heartbeat("kalshi")
+                heartbeat_task = asyncio.create_task(_connection_heartbeat("kalshi"))
+                write_queue = asyncio.Queue(maxsize=PRICE_WRITE_QUEUE_MAXSIZE)
+                writer_task = asyncio.create_task(_price_writer("kalshi", db_path, write_queue))
                 set_stream_health("kalshi", True)
                 async for message in ws:
+                    touch_stream_heartbeat("kalshi")
+                    payload = _decode_message(message)
+                    if payload is not None:
+                        record_stream_sequence("kalshi", _extract_sequence(payload))
+                        backlog_warning = _extract_backlog_warning(payload)
+                        if backlog_warning is not None:
+                            set_stream_backlog_warning("kalshi", backlog_warning)
                     snapshots = _handle_ws_message(
-                        message,
+                        payload if payload is not None else message,
                         levels_by_ticker,
                         market_id_to_ticker,
                         market_by_ticker,
                     )
-                    if snapshots:
-                        insert_prices(db_path, snapshots)
+                    if snapshots and write_queue is not None:
+                        _enqueue_snapshots(write_queue, snapshots, "kalshi")
                     delta_count += 1
                     if delta_count % 200 == 0:
                         logger.debug("Kalshi WS deltas processed=%d", delta_count)
         except asyncio.CancelledError:
             logger.info("Kalshi WS stream cancelled")
             set_stream_health("kalshi", False)
+            set_stream_connected("kalshi", False)
             return
         except Exception as exc:
             logger.warning("Kalshi WS stream ended: %s", exc)
             set_stream_health("kalshi", False)
+            set_stream_connected("kalshi", False)
             continue
+        finally:
+            if writer_task and write_queue is not None:
+                await _stop_price_writer(writer_task, write_queue, "kalshi")
+            if heartbeat_task:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
 
 
 def _handle_ws_message(
-    message: str,
+    message: object,
     levels_by_ticker: Dict[str, Dict[str, Dict[float, float]]],
     market_id_to_ticker: Dict[str, str],
     market_by_ticker: Dict[str, Market],
 ) -> List[PriceSnapshot]:
-    try:
-        data = json.loads(message)
-    except json.JSONDecodeError:
+    if isinstance(message, dict):
+        data = message
+    elif isinstance(message, str):
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            return []
+    else:
         return []
     if not isinstance(data, dict):
         return []
@@ -270,6 +313,113 @@ def _parse_ws_ts(value: object) -> Optional[datetime]:
         return None
 
 
+async def _connection_heartbeat(venue: str, *, interval_seconds: float = 1.0) -> None:
+    while True:
+        touch_stream_heartbeat(venue)
+        await asyncio.sleep(interval_seconds)
+
+
+def _decode_message(message: str) -> Optional[Dict[str, object]]:
+    try:
+        payload = json.loads(message)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(payload, dict):
+        return payload
+    return None
+
+
+def _extract_sequence(payload: Dict[str, object]) -> Optional[int]:
+    for key in ("seq", "sequence", "sequence_number"):
+        value = payload.get(key)
+        if isinstance(value, int):
+            return value
+    msg = payload.get("msg")
+    if isinstance(msg, dict):
+        for key in ("seq", "sequence", "sequence_number"):
+            value = msg.get(key)
+            if isinstance(value, int):
+                return value
+    return None
+
+
+def _extract_backlog_warning(payload: Dict[str, object]) -> Optional[bool]:
+    if payload.get("type") == "warning":
+        code = str(payload.get("code") or "").lower()
+        text = str(payload.get("msg") or payload.get("message") or "").lower()
+        if "backlog" in code or "backlog" in text:
+            return True
+    status = payload.get("backlog_warning")
+    if isinstance(status, bool):
+        return status
+    return None
+
+
+def _enqueue_snapshots(write_queue: asyncio.Queue, snapshots: List[PriceSnapshot], venue: str) -> None:
+    try:
+        write_queue.put_nowait(snapshots)
+        if write_queue.maxsize and write_queue.qsize() < (write_queue.maxsize // 2):
+            set_stream_backlog_warning(venue, False)
+        return
+    except asyncio.QueueFull:
+        pass
+
+    # Keep the most recent snapshots if the writer falls behind.
+    try:
+        write_queue.get_nowait()
+    except asyncio.QueueEmpty:
+        pass
+    try:
+        write_queue.put_nowait(snapshots)
+    except asyncio.QueueFull:
+        logger.debug("%s price write queue still full; dropping snapshots=%d", venue, len(snapshots))
+        return
+    set_stream_backlog_warning(venue, True)
+
+
+async def _price_writer(venue: str, db_path: str, write_queue: asyncio.Queue) -> None:
+    while True:
+        batch = await write_queue.get()
+        if batch is None:
+            return
+        merged = list(batch)
+        while True:
+            try:
+                next_batch = write_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if next_batch is None:
+                if merged:
+                    await asyncio.to_thread(insert_prices, db_path, merged)
+                return
+            merged.extend(next_batch)
+        if not merged:
+            continue
+        try:
+            await asyncio.to_thread(insert_prices, db_path, merged)
+        except Exception as exc:
+            logger.warning("%s price write failed: %s", venue, exc)
+
+
+async def _stop_price_writer(writer_task: asyncio.Task, write_queue: asyncio.Queue, venue: str) -> None:
+    try:
+        write_queue.put_nowait(None)
+    except asyncio.QueueFull:
+        try:
+            write_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            write_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            logger.debug("%s price writer queue full during shutdown", venue)
+            writer_task.cancel()
+    try:
+        await writer_task
+    except asyncio.CancelledError:
+        pass
+
+
 def _ws_connect_kwargs(headers: Dict[str, str]) -> Dict[str, object]:
     try:
         import inspect
@@ -316,6 +466,14 @@ def _kalshi_ws_headers(
         "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode("utf-8"),
         "KALSHI-ACCESS-TIMESTAMP": timestamp,
     }
+
+
+def _normalize_kalshi_ws_url(raw_url: str) -> str:
+    """Kalshi WS auth signature depends on path; default host-only URL needs v2 path."""
+    parsed = urlparse(raw_url)
+    if not parsed.path or parsed.path == "/":
+        parsed = parsed._replace(path="/trade-api/ws/v2")
+    return urlunparse(parsed).rstrip("/")
 
 
 def _parse_float(value: object) -> Optional[float]:

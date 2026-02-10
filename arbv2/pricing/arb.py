@@ -6,10 +6,12 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 
 ORDERBOOKS: Dict[Tuple[str, str, str], Dict[str, object]] = {}
+ORDERBOOK_UPDATE_SUBSCRIBERS: Dict[int, Callable[[str, str, str], None]] = {}
+_ORDERBOOK_SUBSCRIBER_SEQ = 0
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +39,28 @@ MIN_EDGE_BPS = int(os.getenv("ARBV2_MIN_EDGE_BPS", "40"))
 RECENT_FIRE_TTL_MS = int(os.getenv("ARBV2_RECENT_FIRE_TTL_MS", "5000"))
 IDEMPOTENCY_BUCKET_MS = int(os.getenv("ARBV2_IDEMPOTENCY_BUCKET_MS", "2000"))
 POST_CONFIRM_ENABLED = os.getenv("ARBV2_POST_CONFIRM_ENABLED", "true") == "true"
-POST_CONFIRM_WINDOW_MS = int(os.getenv("ARBV2_POST_CONFIRM_WINDOW_MS", "400"))
 POST_CONFIRM_MAX_EDGE_DECAY_BPS = int(os.getenv("ARBV2_POST_CONFIRM_MAX_EDGE_DECAY_BPS", "50"))
-POST_CONFIRM_MAX_SYNC_SKEW_SECONDS = float(os.getenv("ARBV2_MAX_SYNC_SKEW_SECONDS", "1.5"))
+STREAM_HEARTBEAT_TIMEOUT_SECONDS = float(os.getenv("ARBV2_STREAM_HEARTBEAT_TIMEOUT_SECONDS", "30"))
 
 STREAM_HEALTH: Dict[str, bool] = {"polymarket": False, "kalshi": False}
+STREAM_STATUS: Dict[str, Dict[str, object]] = {
+    "polymarket": {
+        "connected": False,
+        "subscribed": False,
+        "last_heartbeat_ts": None,
+        "backlog_warning": False,
+        "dropped_sequences": 0,
+        "last_sequence": None,
+    },
+    "kalshi": {
+        "connected": False,
+        "subscribed": False,
+        "last_heartbeat_ts": None,
+        "backlog_warning": False,
+        "dropped_sequences": 0,
+        "last_sequence": None,
+    },
+}
 
 
 class ArbMode(str, Enum):
@@ -136,14 +155,170 @@ def update_orderbook(
         "last_update_ts_utc": _ensure_utc(last_update_ts_utc),
         "fetched_at_ts": time.time(),
     }
+    if ORDERBOOK_UPDATE_SUBSCRIBERS:
+        for callback in list(ORDERBOOK_UPDATE_SUBSCRIBERS.values()):
+            try:
+                callback(venue, market_id, outcome_label)
+            except Exception:
+                logger.debug("orderbook update subscriber callback failed", exc_info=True)
+
+
+def subscribe_orderbook_updates(callback: Callable[[str, str, str], None]) -> int:
+    global _ORDERBOOK_SUBSCRIBER_SEQ
+    _ORDERBOOK_SUBSCRIBER_SEQ += 1
+    token = _ORDERBOOK_SUBSCRIBER_SEQ
+    ORDERBOOK_UPDATE_SUBSCRIBERS[token] = callback
+    return token
+
+
+def unsubscribe_orderbook_updates(token: int) -> None:
+    ORDERBOOK_UPDATE_SUBSCRIBERS.pop(token, None)
 
 
 def set_stream_health(venue: str, healthy: bool) -> None:
     STREAM_HEALTH[venue] = healthy
+    state = STREAM_STATUS.setdefault(
+        venue,
+        {
+            "connected": False,
+            "subscribed": False,
+            "last_heartbeat_ts": None,
+            "backlog_warning": False,
+            "dropped_sequences": 0,
+            "last_sequence": None,
+        },
+    )
+    if healthy:
+        state["connected"] = True
+        state["subscribed"] = True
+        state["last_heartbeat_ts"] = time.time()
+    else:
+        state["connected"] = False
+        state["subscribed"] = False
+        state["last_heartbeat_ts"] = None
+        state["backlog_warning"] = False
+        state["dropped_sequences"] = 0
+        state["last_sequence"] = None
 
 
 def streams_healthy(venues: List[str]) -> bool:
-    return all(STREAM_HEALTH.get(venue, False) for venue in venues)
+    ok, _ = stream_health_status(venues)
+    return ok
+
+
+def set_stream_connected(venue: str, connected: bool) -> None:
+    state = STREAM_STATUS.setdefault(
+        venue,
+        {
+            "connected": False,
+            "subscribed": False,
+            "last_heartbeat_ts": None,
+            "backlog_warning": False,
+            "dropped_sequences": 0,
+            "last_sequence": None,
+        },
+    )
+    state["connected"] = connected
+    if not connected:
+        state["subscribed"] = False
+        state["last_heartbeat_ts"] = None
+    STREAM_HEALTH[venue] = bool(state.get("connected")) and bool(state.get("subscribed"))
+
+
+def set_stream_subscribed(venue: str, subscribed: bool) -> None:
+    state = STREAM_STATUS.setdefault(
+        venue,
+        {
+            "connected": False,
+            "subscribed": False,
+            "last_heartbeat_ts": None,
+            "backlog_warning": False,
+            "dropped_sequences": 0,
+            "last_sequence": None,
+        },
+    )
+    state["subscribed"] = subscribed
+    STREAM_HEALTH[venue] = bool(state.get("connected")) and bool(state.get("subscribed"))
+
+
+def touch_stream_heartbeat(venue: str, *, ts: Optional[float] = None) -> None:
+    state = STREAM_STATUS.setdefault(
+        venue,
+        {
+            "connected": False,
+            "subscribed": False,
+            "last_heartbeat_ts": None,
+            "backlog_warning": False,
+            "dropped_sequences": 0,
+            "last_sequence": None,
+        },
+    )
+    state["last_heartbeat_ts"] = float(ts if ts is not None else time.time())
+
+
+def set_stream_backlog_warning(venue: str, warning: bool) -> None:
+    state = STREAM_STATUS.setdefault(
+        venue,
+        {
+            "connected": False,
+            "subscribed": False,
+            "last_heartbeat_ts": None,
+            "backlog_warning": False,
+            "dropped_sequences": 0,
+            "last_sequence": None,
+        },
+    )
+    state["backlog_warning"] = warning
+
+
+def record_stream_sequence(venue: str, sequence: Optional[int]) -> None:
+    if sequence is None:
+        return
+    state = STREAM_STATUS.setdefault(
+        venue,
+        {
+            "connected": False,
+            "subscribed": False,
+            "last_heartbeat_ts": None,
+            "backlog_warning": False,
+            "dropped_sequences": 0,
+            "last_sequence": None,
+        },
+    )
+    last_sequence = state.get("last_sequence")
+    if isinstance(last_sequence, int) and sequence > last_sequence + 1:
+        state["dropped_sequences"] = int(state.get("dropped_sequences") or 0) + (sequence - last_sequence - 1)
+    state["last_sequence"] = sequence
+
+
+def stream_health_status(venues: List[str], *, now_ts: Optional[float] = None) -> Tuple[bool, Dict[str, str]]:
+    now = float(now_ts if now_ts is not None else time.time())
+    reasons: Dict[str, str] = {}
+    for venue in venues:
+        state = STREAM_STATUS.get(venue)
+        if not state:
+            reasons[venue] = "missing_stream_state"
+            continue
+        if not bool(state.get("connected")):
+            reasons[venue] = "stream_disconnected"
+            continue
+        if not bool(state.get("subscribed")):
+            reasons[venue] = "stream_unsubscribed"
+            continue
+        heartbeat = state.get("last_heartbeat_ts")
+        if not isinstance(heartbeat, (int, float)):
+            reasons[venue] = "missing_heartbeat"
+            continue
+        if STREAM_HEARTBEAT_TIMEOUT_SECONDS > 0 and (now - float(heartbeat)) > STREAM_HEARTBEAT_TIMEOUT_SECONDS:
+            reasons[venue] = "heartbeat_timeout"
+            continue
+        if bool(state.get("backlog_warning")):
+            reasons[venue] = "backlog_warning"
+            continue
+        if int(state.get("dropped_sequences") or 0) > 0:
+            reasons[venue] = "sequence_gap_detected"
+            continue
+    return (len(reasons) == 0), reasons
 
 
 def get_fill_stats(
@@ -818,16 +993,6 @@ def _evaluate_event_outcome_paired_metrics(event: EventMarkets, Q_max: float) ->
     if len(event.outcomes) != 2:
         return None
     outcome_a, outcome_b = event.outcomes
-    keys = [
-        ("kalshi", event.kalshi_by_outcome.get(outcome_a), outcome_a),
-        ("kalshi", event.kalshi_by_outcome.get(outcome_b), outcome_b),
-        ("polymarket", event.polymarket_by_outcome.get(outcome_a), outcome_a),
-        ("polymarket", event.polymarket_by_outcome.get(outcome_b), outcome_b),
-    ]
-    if not _books_fresh_by_venue(keys):
-        return None
-    if not _books_fresh(keys, datetime.now(timezone.utc)):
-        return None
 
     k_a = event.kalshi_by_outcome.get(outcome_a)
     k_b = event.kalshi_by_outcome.get(outcome_b)
@@ -929,17 +1094,6 @@ def _evaluate_binary_mirror_paired(event: EventMarkets, Q_min: float, Q_max: flo
 
 
 def _evaluate_binary_mirror_paired_metrics(event: EventMarkets, Q_max: float) -> Optional[Dict[str, object]]:
-    keys = [
-        ("kalshi", event.kalshi_by_outcome.get("YES"), "YES"),
-        ("kalshi", event.kalshi_by_outcome.get("NO"), "NO"),
-        ("polymarket", event.polymarket_by_outcome.get("YES"), "YES"),
-        ("polymarket", event.polymarket_by_outcome.get("NO"), "NO"),
-    ]
-    if not _books_fresh_by_venue(keys):
-        return None
-    if not _books_fresh(keys, datetime.now(timezone.utc)):
-        return None
-
     k_yes = event.kalshi_by_outcome.get("YES")
     k_no = event.kalshi_by_outcome.get("NO")
     p_yes = event.polymarket_by_outcome.get("YES")
@@ -1384,18 +1538,13 @@ def post_confirm_decision(
     key = _post_confirm_fingerprint(event, arb_type, signal)
     if now_ms is None:
         now_ms = int(time.time() * 1000)
-    detected_ts = signal.get("detected_ts")
-    if detected_ts is None:
-        return {"ok": False, "reason": "missing_detected_ts"}
-    try:
-        detected_ts_ms = int(detected_ts)
-    except (TypeError, ValueError):
-        return {"ok": False, "reason": "invalid_detected_ts"}
     reasons: List[str] = []
     legs = signal.get("legs") or []
-    keys: List[Tuple[str, Optional[str], str]] = []
-    kalshi_ts = None
-    polymarket_ts = None
+    venues = sorted({str(leg.get("venue") or "") for leg in legs if str(leg.get("venue") or "")})
+    streams_ok, stream_reasons = stream_health_status(venues)
+    if not streams_ok:
+        reasons.append("stream_unhealthy")
+
     kalshi_ts_utc = None
     polymarket_ts_utc = None
     for leg in legs:
@@ -1409,33 +1558,13 @@ def post_confirm_decision(
         if not book:
             reasons.append("missing_book")
             continue
-        fetched_at = book.get("fetched_at_ts")
-        if not isinstance(fetched_at, (int, float)):
-            reasons.append("missing_fetched_at")
-        else:
-            if float(fetched_at) * 1000 <= detected_ts_ms:
-                reasons.append("not_updated_since_detect")
-            keys.append((venue, market_id, outcome_label))
         ts_value = book.get("last_update_ts_utc")
         if isinstance(ts_value, datetime):
-            ts_seconds = _ensure_utc(ts_value).timestamp()
-        elif isinstance(fetched_at, (int, float)):
-            ts_seconds = float(fetched_at)
-        else:
-            ts_seconds = None
-        if venue == "kalshi" and ts_seconds is not None:
-            kalshi_ts = ts_seconds if kalshi_ts is None else max(kalshi_ts, ts_seconds)
-            kalshi_ts_utc = datetime.fromtimestamp(kalshi_ts, tz=timezone.utc).isoformat()
-        if venue == "polymarket" and ts_seconds is not None:
-            polymarket_ts = ts_seconds if polymarket_ts is None else max(polymarket_ts, ts_seconds)
-            polymarket_ts_utc = datetime.fromtimestamp(polymarket_ts, tz=timezone.utc).isoformat()
-    if keys and not _books_fresh_by_venue(keys):
-        reasons.append("stale_book")
-    sync_skew_seconds = None
-    if kalshi_ts is not None and polymarket_ts is not None:
-        sync_skew_seconds = abs(kalshi_ts - polymarket_ts)
-        if sync_skew_seconds > POST_CONFIRM_MAX_SYNC_SKEW_SECONDS:
-            reasons.append("sync_skew_exceeded")
+            ts_iso = _ensure_utc(ts_value).isoformat()
+            if venue == "kalshi":
+                kalshi_ts_utc = ts_iso
+            if venue == "polymarket":
+                polymarket_ts_utc = ts_iso
 
     size = float(signal.get("size") or 0.0)
     if size <= 0:
@@ -1473,17 +1602,12 @@ def post_confirm_decision(
             reasons.append("non_positive_pnl")
         detected_edge = signal_edge_bps(signal)
         edge_decay_detected = detected_edge - edge_bps
-        if now_ms - detected_ts_ms <= POST_CONFIRM_WINDOW_MS:
-            if edge_decay_detected > POST_CONFIRM_MAX_EDGE_DECAY_BPS:
-                reasons.append("edge_decay_exceeded")
+        if edge_decay_detected > POST_CONFIRM_MAX_EDGE_DECAY_BPS:
+            reasons.append("edge_decay_exceeded")
 
     prev = POST_CONFIRM_CACHE.get(key)
-    age_ms = None
     edge_decay = None
     if prev and edge_bps is not None:
-        age_ms = now_ms - int(prev["ts"])
-        if age_ms > POST_CONFIRM_WINDOW_MS:
-            reasons.append("window_expired")
         edge_decay = float(prev["edge_bps"]) - edge_bps
         if edge_decay > POST_CONFIRM_MAX_EDGE_DECAY_BPS:
             reasons.append("edge_decay")
@@ -1496,10 +1620,9 @@ def post_confirm_decision(
             "edge_bps": edge_bps,
             "prev_edge_bps": float(prev["edge_bps"]) if prev else None,
             "edge_decay_bps": edge_decay_out,
-            "age_ms": age_ms,
             "expected_pnl_usd": expected_pnl,
             "limit_prices": eff_prices,
-            "sync_skew_seconds": sync_skew_seconds,
+            "stream_reasons": stream_reasons,
             "kalshi_book_ts_utc": kalshi_ts_utc,
             "polymarket_book_ts_utc": polymarket_ts_utc,
         }
@@ -1516,25 +1639,7 @@ def post_confirm_decision(
             "edge_bps": edge_bps,
             "expected_pnl_usd": expected_pnl,
             "limit_prices": eff_prices,
-            "sync_skew_seconds": sync_skew_seconds,
-            "kalshi_book_ts_utc": kalshi_ts_utc,
-            "polymarket_book_ts_utc": polymarket_ts_utc,
-        }
-    if age_ms is not None and age_ms > POST_CONFIRM_WINDOW_MS:
-        POST_CONFIRM_CACHE[key] = {
-            "ts": float(now_ms),
-            "edge_bps": edge_bps,
-        }
-        logger.debug("post-confirm reset key=%s age_ms=%d", key, age_ms)
-        return {
-            "ok": False,
-            "reason": "window_expired",
-            "edge_bps": edge_bps,
-            "prev_edge_bps": float(prev["edge_bps"]),
-            "age_ms": age_ms,
-            "expected_pnl_usd": expected_pnl,
-            "limit_prices": eff_prices,
-            "sync_skew_seconds": sync_skew_seconds,
+            "stream_reasons": stream_reasons,
             "kalshi_book_ts_utc": kalshi_ts_utc,
             "polymarket_book_ts_utc": polymarket_ts_utc,
         }
@@ -1547,23 +1652,21 @@ def post_confirm_decision(
             "edge_bps": edge_bps,
             "prev_edge_bps": float(prev["edge_bps"]),
             "edge_decay_bps": edge_decay_out,
-            "age_ms": age_ms,
             "expected_pnl_usd": expected_pnl,
             "limit_prices": eff_prices,
-            "sync_skew_seconds": sync_skew_seconds,
+            "stream_reasons": stream_reasons,
         }
     POST_CONFIRM_CACHE.pop(key, None)
-    logger.debug("post-confirm accept key=%s age_ms=%d", key, age_ms)
+    logger.debug("post-confirm accept key=%s", key)
     return {
         "ok": True,
         "reason": "second_confirm",
         "edge_bps": edge_bps,
         "prev_edge_bps": float(prev["edge_bps"]),
         "edge_decay_bps": edge_decay_out,
-        "age_ms": age_ms,
         "expected_pnl_usd": expected_pnl,
         "limit_prices": eff_prices,
-        "sync_skew_seconds": sync_skew_seconds,
+        "stream_reasons": stream_reasons,
         "kalshi_book_ts_utc": kalshi_ts_utc,
         "polymarket_book_ts_utc": polymarket_ts_utc,
     }
@@ -1582,18 +1685,20 @@ def confirm_on_trigger(opportunity: Dict[str, object]) -> Dict[str, object]:
         return _confirm_result(False, "ttl_expired", 0.0, 0.0)
 
     legs = opportunity.get("legs") or []
-    keys: List[Tuple[str, Optional[str], str]] = []
+    venues = sorted({str(leg.get("venue") or "") for leg in legs if str(leg.get("venue") or "")})
+    streams_ok, stream_reasons = stream_health_status(venues)
+    if not streams_ok:
+        result = _confirm_result(False, "stream_unhealthy", 0.0, 0.0)
+        result["stream_reasons"] = stream_reasons
+        return result
     for leg in legs:
         venue = str(leg.get("venue") or "")
         market_id = str(leg.get("market_id") or "")
         outcome_label = str(leg.get("outcome_label") or "")
         if not venue or not market_id or not outcome_label:
             return _confirm_result(False, "missing_book", 0.0, 0.0)
-        keys.append((venue, market_id, outcome_label))
         if (venue, market_id, outcome_label) not in ORDERBOOKS:
             return _confirm_result(False, "missing_book", 0.0, 0.0)
-    if not _books_fresh_by_venue(keys):
-        return _confirm_result(False, "stale_book", 0.0, 0.0)
 
     size = float(opportunity.get("size") or 0.0)
     if size <= 0:

@@ -8,12 +8,21 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import requests
 from arbv2.config import Config
 from arbv2.models import Market, PriceSnapshot
-from arbv2.pricing.arb import set_stream_health, update_orderbook
+from arbv2.pricing.arb import (
+    record_stream_sequence,
+    set_stream_backlog_warning,
+    set_stream_connected,
+    set_stream_health,
+    set_stream_subscribed,
+    touch_stream_heartbeat,
+    update_orderbook,
+)
 from arbv2.storage import insert_prices
 from arbv2.teams import canonicalize_team, league_hint_from_text, league_hint_from_url
 
 
 logger = logging.getLogger(__name__)
+PRICE_WRITE_QUEUE_MAXSIZE = 1024
 
 
 def validate_clob_auth(config: Config) -> None:
@@ -115,30 +124,54 @@ async def stream_books(config: Config, token_map: Dict[str, List[Tuple[Market, s
     last_trade: Dict[str, Optional[float]] = {}
     backoff_seconds = 1
     while True:
+        heartbeat_task: Optional[asyncio.Task] = None
+        writer_task: Optional[asyncio.Task] = None
+        write_queue: Optional[asyncio.Queue] = None
         try:
             async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
+                set_stream_connected("polymarket", True)
+                set_stream_subscribed("polymarket", False)
+                set_stream_backlog_warning("polymarket", False)
                 await ws.send(json.dumps({"assets_ids": asset_ids, "type": "market"}))
                 logger.info("Polymarket WS subscribed assets=%d", len(asset_ids))
+                set_stream_subscribed("polymarket", True)
+                touch_stream_heartbeat("polymarket")
+                heartbeat_task = asyncio.create_task(_connection_heartbeat("polymarket"))
+                write_queue = asyncio.Queue(maxsize=PRICE_WRITE_QUEUE_MAXSIZE)
+                writer_task = asyncio.create_task(_price_writer("polymarket", db_path, write_queue))
                 set_stream_health("polymarket", True)
                 backoff_seconds = 1
                 message_count = 0
                 try:
                     async for message in ws:
+                        touch_stream_heartbeat("polymarket")
+                        _update_stream_consistency(message)
                         message_count += 1
                         if message_count % 100 == 0:
                             logger.debug("Polymarket WS messages=%d", message_count)
                         snapshots = _handle_message(message, token_map, orderbooks, last_trade)
-                        if snapshots:
-                            insert_prices(db_path, snapshots)
+                        if snapshots and write_queue is not None:
+                            _enqueue_snapshots(write_queue, snapshots, "polymarket")
                 finally:
                     pass
         except asyncio.CancelledError:
             logger.info("Polymarket WS stream cancelled")
             set_stream_health("polymarket", False)
+            set_stream_connected("polymarket", False)
             return
         except Exception as exc:
             logger.warning("Polymarket WS stream ended: %s", exc)
             set_stream_health("polymarket", False)
+            set_stream_connected("polymarket", False)
+        finally:
+            if writer_task and write_queue is not None:
+                await _stop_price_writer(writer_task, write_queue, "polymarket")
+            if heartbeat_task:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
         await asyncio.sleep(backoff_seconds)
         backoff_seconds = min(backoff_seconds * 2, 60)
 
@@ -337,6 +370,107 @@ def _best_bid_from_map(levels: Dict[float, float]) -> Optional[float]:
 
 def _best_ask_from_map(levels: Dict[float, float]) -> Optional[float]:
     return min(levels.keys()) if levels else None
+
+
+async def _connection_heartbeat(venue: str, *, interval_seconds: float = 1.0) -> None:
+    while True:
+        touch_stream_heartbeat(venue)
+        await asyncio.sleep(interval_seconds)
+
+
+def _update_stream_consistency(message: str) -> None:
+    try:
+        payload = json.loads(message)
+    except json.JSONDecodeError:
+        return
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                _record_consistency_from_dict(item)
+        return
+    if isinstance(payload, dict):
+        _record_consistency_from_dict(payload)
+
+
+def _record_consistency_from_dict(payload: Dict[str, object]) -> None:
+    for key in ("seq", "sequence", "sequence_number"):
+        value = payload.get(key)
+        if isinstance(value, int):
+            record_stream_sequence("polymarket", value)
+            break
+    if payload.get("event_type") == "warning":
+        text = str(payload.get("message") or payload.get("warning") or "").lower()
+        if "backlog" in text:
+            set_stream_backlog_warning("polymarket", True)
+            return
+    flag = payload.get("backlog_warning")
+    if isinstance(flag, bool):
+        set_stream_backlog_warning("polymarket", flag)
+
+
+def _enqueue_snapshots(write_queue: asyncio.Queue, snapshots: List[PriceSnapshot], venue: str) -> None:
+    try:
+        write_queue.put_nowait(snapshots)
+        if write_queue.maxsize and write_queue.qsize() < (write_queue.maxsize // 2):
+            set_stream_backlog_warning(venue, False)
+        return
+    except asyncio.QueueFull:
+        pass
+
+    # Keep the most recent snapshots if the writer falls behind.
+    try:
+        write_queue.get_nowait()
+    except asyncio.QueueEmpty:
+        pass
+    try:
+        write_queue.put_nowait(snapshots)
+    except asyncio.QueueFull:
+        logger.debug("%s price write queue still full; dropping snapshots=%d", venue, len(snapshots))
+        return
+    set_stream_backlog_warning(venue, True)
+
+
+async def _price_writer(venue: str, db_path: str, write_queue: asyncio.Queue) -> None:
+    while True:
+        batch = await write_queue.get()
+        if batch is None:
+            return
+        merged = list(batch)
+        while True:
+            try:
+                next_batch = write_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if next_batch is None:
+                if merged:
+                    await asyncio.to_thread(insert_prices, db_path, merged)
+                return
+            merged.extend(next_batch)
+        if not merged:
+            continue
+        try:
+            await asyncio.to_thread(insert_prices, db_path, merged)
+        except Exception as exc:
+            logger.warning("%s price write failed: %s", venue, exc)
+
+
+async def _stop_price_writer(writer_task: asyncio.Task, write_queue: asyncio.Queue, venue: str) -> None:
+    try:
+        write_queue.put_nowait(None)
+    except asyncio.QueueFull:
+        try:
+            write_queue.get_nowait()
+        except asyncio.QueueEmpty:
+            pass
+        try:
+            write_queue.put_nowait(None)
+        except asyncio.QueueFull:
+            logger.debug("%s price writer queue full during shutdown", venue)
+            writer_task.cancel()
+    try:
+        await writer_task
+    except asyncio.CancelledError:
+        pass
 
 
 def _resolve_token_ids(market: Market) -> List[tuple]:

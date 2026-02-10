@@ -6,7 +6,7 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 from arbv2.config import load_config
 from arbv2.ingest.kalshi import ingest_kalshi
@@ -32,6 +32,8 @@ from arbv2.pricing.arb import (
     confirm_on_trigger,
     post_confirm_decision,
     signal_edge_bps,
+    subscribe_orderbook_updates,
+    unsubscribe_orderbook_updates,
     evaluate_paired_metrics,
     evaluate_profit_at_size,
     evaluate_profit_rows,
@@ -54,6 +56,18 @@ from arbv2.storage import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _purge_db_files(db_path: str) -> None:
+    removed: List[str] = []
+    for path in [db_path, f"{db_path}-wal", f"{db_path}-shm", f"{db_path}-journal"]:
+        if os.path.exists(path):
+            os.remove(path)
+            removed.append(path)
+    if removed:
+        logger.info("Purged db files: %s", ", ".join(removed))
+    else:
+        logger.info("No db files to purge for path: %s", db_path)
 
 
 def main() -> int:
@@ -404,10 +418,113 @@ async def _run_arb_stream(config) -> None:
     poly_preds = _parse_all(poly_markets)
     events_event = _build_event_markets(kalshi_markets, poly_markets, kalshi_preds, poly_preds)
     events_binary = _build_binary_events(config.db_path)
-    while True:
-        _scan_arb_events(config.db_path, events_event, ArbMode.EVENT_OUTCOME, title_by_market_id)
-        _scan_arb_events(config.db_path, events_binary, ArbMode.BINARY_MIRROR, title_by_market_id)
-        await asyncio.sleep(2)
+    events_event_by_leg = _index_events_by_leg(events_event)
+    events_binary_by_leg = _index_events_by_leg(events_binary)
+
+    # Prime arb_scans with current state once at stream startup.
+    await asyncio.to_thread(
+        _scan_arb_cycle,
+        config.db_path,
+        events_event,
+        events_binary,
+        title_by_market_id,
+    )
+
+    loop = asyncio.get_running_loop()
+    update_queue: asyncio.Queue[Tuple[str, str]] = asyncio.Queue(maxsize=8192)
+    pending_legs: Set[Tuple[str, str]] = set()
+    full_rescan_requested = False
+
+    def _enqueue_leg_update(venue: str, market_id: str) -> None:
+        nonlocal full_rescan_requested
+        leg_key = (venue, market_id)
+        if leg_key in pending_legs:
+            return
+        if update_queue.full():
+            full_rescan_requested = True
+            return
+        pending_legs.add(leg_key)
+        update_queue.put_nowait(leg_key)
+
+    def _on_orderbook_update(venue: str, market_id: str, outcome_label: str) -> None:
+        _ = outcome_label
+        loop.call_soon_threadsafe(_enqueue_leg_update, venue, market_id)
+
+    subscriber_token = subscribe_orderbook_updates(_on_orderbook_update)
+    try:
+        while True:
+            first_leg = await update_queue.get()
+            changed_legs: Set[Tuple[str, str]] = {first_leg}
+            pending_legs.discard(first_leg)
+            while True:
+                try:
+                    leg = update_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                pending_legs.discard(leg)
+                changed_legs.add(leg)
+
+            if full_rescan_requested:
+                full_rescan_requested = False
+                scan_event = events_event
+                scan_binary = events_binary
+            else:
+                scan_event = _events_for_legs(events_event_by_leg, changed_legs)
+                scan_binary = _events_for_legs(events_binary_by_leg, changed_legs)
+
+            if not scan_event and not scan_binary:
+                continue
+
+            await asyncio.to_thread(
+                _scan_arb_cycle,
+                config.db_path,
+                scan_event,
+                scan_binary,
+                title_by_market_id,
+            )
+    finally:
+        unsubscribe_orderbook_updates(subscriber_token)
+
+
+def _scan_arb_cycle(
+    db_path: str,
+    events_event: List[EventMarkets],
+    events_binary: List[EventMarkets],
+    title_by_market_id: Dict[str, str],
+) -> None:
+    _scan_arb_events(db_path, events_event, ArbMode.EVENT_OUTCOME, title_by_market_id)
+    _scan_arb_events(db_path, events_binary, ArbMode.BINARY_MIRROR, title_by_market_id)
+
+
+def _index_events_by_leg(events: List[EventMarkets]) -> Dict[Tuple[str, str], List[EventMarkets]]:
+    index: Dict[Tuple[str, str], List[EventMarkets]] = {}
+    for event in events:
+        seen: Set[Tuple[str, str]] = set()
+        for market_id in event.kalshi_by_outcome.values():
+            if market_id:
+                seen.add(("kalshi", market_id))
+        for market_id in event.polymarket_by_outcome.values():
+            if market_id:
+                seen.add(("polymarket", market_id))
+        for leg_key in seen:
+            index.setdefault(leg_key, []).append(event)
+    return index
+
+
+def _events_for_legs(
+    index: Dict[Tuple[str, str], List[EventMarkets]],
+    legs: Set[Tuple[str, str]],
+) -> List[EventMarkets]:
+    selected: List[EventMarkets] = []
+    seen_ids: Set[int] = set()
+    for leg_key in legs:
+        for event in index.get(leg_key, []):
+            marker = id(event)
+            if marker in seen_ids:
+                continue
+            seen_ids.add(marker)
+            selected.append(event)
+    return selected
 
 
 async def _loop_heartbeat(name: str, *, interval: float = 5.0, warn_threshold: float = 1.0) -> None:
@@ -423,6 +540,7 @@ async def _loop_heartbeat(name: str, *, interval: float = 5.0, warn_threshold: f
 
 
 def _run_live(config, args) -> int:
+    _purge_db_files(config.db_path)
     init_db(config.db_path)
     if not args.polymarket and not args.kalshi:
         args.polymarket = True

@@ -1,24 +1,40 @@
+import copy
 import time
 import unittest
-from unittest.mock import patch
 from datetime import datetime, timezone
 
-from arbv2.pricing import arb as arb_module
 from arbv2.pricing.arb import (
     CONFIRM_IDEMPOTENCY,
-    KALSHI_MAX_AGE_SECONDS,
     ORDERBOOKS,
-    POLY_MAX_AGE_SECONDS,
+    STREAM_HEALTH,
+    STREAM_STATUS,
     TRIGGER_CONFIRM_TTL_MS,
     confirm_on_trigger,
+    set_stream_connected,
+    set_stream_subscribed,
+    touch_stream_heartbeat,
     update_orderbook,
 )
 
 
 class ConfirmOnTriggerTests(unittest.TestCase):
     def setUp(self) -> None:
+        self._old_stream_health = dict(STREAM_HEALTH)
+        self._old_stream_status = copy.deepcopy(STREAM_STATUS)
         ORDERBOOKS.clear()
         CONFIRM_IDEMPOTENCY.clear()
+        set_stream_connected("kalshi", True)
+        set_stream_subscribed("kalshi", True)
+        set_stream_connected("polymarket", True)
+        set_stream_subscribed("polymarket", True)
+        touch_stream_heartbeat("kalshi", ts=time.time())
+        touch_stream_heartbeat("polymarket", ts=time.time())
+
+    def tearDown(self) -> None:
+        STREAM_HEALTH.clear()
+        STREAM_HEALTH.update(self._old_stream_health)
+        STREAM_STATUS.clear()
+        STREAM_STATUS.update(self._old_stream_status)
 
     def _build_signal(self, detected_ts: int) -> dict:
         return {
@@ -53,22 +69,15 @@ class ConfirmOnTriggerTests(unittest.TestCase):
         self.assertTrue(decision["ok"])
         self.assertGreater(decision["recalculated_edge_bps"], 0)
 
-    def test_confirm_rejects_stale_books(self) -> None:
+    def test_confirm_rejects_stream_unhealthy(self) -> None:
         self._seed_books()
-        now = time.time()
-        with patch.object(arb_module, "POLY_MAX_AGE_SECONDS", 1.0), patch.object(
-            arb_module, "KALSHI_MAX_AGE_SECONDS", 1.0
-        ):
-            for (venue, _, _), book in list(ORDERBOOKS.items()):
-                if venue == "polymarket":
-                    book["fetched_at_ts"] = now - (arb_module.POLY_MAX_AGE_SECONDS + 1)
-                else:
-                    book["fetched_at_ts"] = now - (arb_module.KALSHI_MAX_AGE_SECONDS + 1)
-            now_ms = int(time.time() * 1000)
-            signal = self._build_signal(now_ms)
-            decision = confirm_on_trigger(signal)
-            self.assertFalse(decision["ok"])
-            self.assertEqual(decision["reason"], "stale_book")
+        set_stream_connected("kalshi", False)
+        now_ms = int(time.time() * 1000)
+        signal = self._build_signal(now_ms)
+        decision = confirm_on_trigger(signal)
+        self.assertFalse(decision["ok"])
+        self.assertEqual(decision["reason"], "stream_unhealthy")
+        self.assertEqual(decision["stream_reasons"]["kalshi"], "stream_disconnected")
 
     def test_confirm_rejects_ttl_expired(self) -> None:
         self._seed_books()
