@@ -3,7 +3,7 @@ import logging
 import re
 import sqlite3
 from datetime import datetime, timezone
-from typing import Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from arbv2.models import Market, MatchResult, PriceSnapshot, SportsPredicate
 from arbv2.teams import canonicalize_team, league_hint_from_series_ticker, league_hint_from_text, league_hint_from_url
@@ -67,6 +67,13 @@ CREATE TABLE IF NOT EXISTS arb_scans (
     event_id TEXT,
     size REAL,
     event_title TEXT
+);
+
+CREATE TABLE IF NOT EXISTS pending_signals (
+    signal_key TEXT NOT NULL PRIMARY KEY,
+    payload_json TEXT NOT NULL,
+    created_ts INTEGER NOT NULL,
+    updated_ts INTEGER NOT NULL
 );
 """
 
@@ -246,6 +253,64 @@ def insert_arb_scans(db_path: str, rows: Iterable[tuple]) -> None:
             """,
             rows_list,
         )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def upsert_pending_signal(
+    db_path: str,
+    signal_key: str,
+    payload: Dict[str, Any],
+    *,
+    now_ms: Optional[int] = None,
+) -> None:
+    conn = _connect(db_path)
+    try:
+        ts = int(now_ms if now_ms is not None else datetime.now(timezone.utc).timestamp() * 1000)
+        payload_json = json.dumps(payload, separators=(",", ":"))
+        conn.execute(
+            """
+            INSERT INTO pending_signals (signal_key, payload_json, created_ts, updated_ts)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(signal_key) DO UPDATE SET
+                payload_json=excluded.payload_json,
+                updated_ts=excluded.updated_ts
+            """,
+            (signal_key, payload_json, ts, ts),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def fetch_pending_signals(db_path: str) -> List[Tuple[str, Dict[str, Any]]]:
+    conn = _connect(db_path)
+    try:
+        rows = conn.execute(
+            """
+            SELECT signal_key, payload_json
+            FROM pending_signals
+            ORDER BY updated_ts ASC
+            """
+        ).fetchall()
+        out: List[Tuple[str, Dict[str, Any]]] = []
+        for row in rows:
+            raw = row["payload_json"]
+            try:
+                payload = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                payload = {}
+            out.append((str(row["signal_key"]), payload if isinstance(payload, dict) else {}))
+        return out
+    finally:
+        conn.close()
+
+
+def delete_pending_signal(db_path: str, signal_key: str) -> None:
+    conn = _connect(db_path)
+    try:
+        conn.execute("DELETE FROM pending_signals WHERE signal_key=?", (signal_key,))
         conn.commit()
     finally:
         conn.close()

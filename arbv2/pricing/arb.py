@@ -1535,7 +1535,6 @@ def post_confirm_decision(
 ) -> Dict[str, object]:
     if not POST_CONFIRM_ENABLED:
         return {"ok": True, "reason": "disabled"}
-    key = _post_confirm_fingerprint(event, arb_type, signal)
     if now_ms is None:
         now_ms = int(time.time() * 1000)
     reasons: List[str] = []
@@ -1605,65 +1604,26 @@ def post_confirm_decision(
         if edge_decay_detected > POST_CONFIRM_MAX_EDGE_DECAY_BPS:
             reasons.append("edge_decay_exceeded")
 
-    prev = POST_CONFIRM_CACHE.get(key)
-    edge_decay = None
-    if prev and edge_bps is not None:
-        edge_decay = float(prev["edge_bps"]) - edge_bps
-        if edge_decay > POST_CONFIRM_MAX_EDGE_DECAY_BPS:
-            reasons.append("edge_decay")
-    edge_decay_out = edge_decay_detected if edge_decay_detected is not None else edge_decay
-
     if reasons:
         return {
             "ok": False,
             "reason": ",".join(sorted(set(reasons))),
             "edge_bps": edge_bps,
-            "prev_edge_bps": float(prev["edge_bps"]) if prev else None,
-            "edge_decay_bps": edge_decay_out,
+            "prev_edge_bps": None,
+            "edge_decay_bps": edge_decay_detected,
             "expected_pnl_usd": expected_pnl,
             "limit_prices": eff_prices,
             "stream_reasons": stream_reasons,
             "kalshi_book_ts_utc": kalshi_ts_utc,
             "polymarket_book_ts_utc": polymarket_ts_utc,
         }
-
-    if not prev:
-        POST_CONFIRM_CACHE[key] = {
-            "ts": float(now_ms),
-            "edge_bps": edge_bps,
-        }
-        logger.debug("post-confirm cached key=%s edge_bps=%.2f", key, edge_bps)
-        return {
-            "ok": False,
-            "reason": "first_confirm_cached",
-            "edge_bps": edge_bps,
-            "expected_pnl_usd": expected_pnl,
-            "limit_prices": eff_prices,
-            "stream_reasons": stream_reasons,
-            "kalshi_book_ts_utc": kalshi_ts_utc,
-            "polymarket_book_ts_utc": polymarket_ts_utc,
-        }
-    if edge_decay is not None and edge_decay > POST_CONFIRM_MAX_EDGE_DECAY_BPS:
-        POST_CONFIRM_CACHE.pop(key, None)
-        logger.debug("post-confirm reject key=%s edge_decay=%.2f", key, edge_decay)
-        return {
-            "ok": False,
-            "reason": "edge_decay",
-            "edge_bps": edge_bps,
-            "prev_edge_bps": float(prev["edge_bps"]),
-            "edge_decay_bps": edge_decay_out,
-            "expected_pnl_usd": expected_pnl,
-            "limit_prices": eff_prices,
-            "stream_reasons": stream_reasons,
-        }
-    POST_CONFIRM_CACHE.pop(key, None)
-    logger.debug("post-confirm accept key=%s", key)
+    logger.debug("post-confirm accept event=%s arb_type=%s", event.event_id, arb_type.value)
     return {
         "ok": True,
-        "reason": "second_confirm",
+        "reason": "confirmed",
         "edge_bps": edge_bps,
-        "prev_edge_bps": float(prev["edge_bps"]),
-        "edge_decay_bps": edge_decay_out,
+        "prev_edge_bps": None,
+        "edge_decay_bps": edge_decay_detected,
         "expected_pnl_usd": expected_pnl,
         "limit_prices": eff_prices,
         "stream_reasons": stream_reasons,

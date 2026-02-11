@@ -65,7 +65,7 @@ class PostConfirmGateTests(unittest.TestCase):
         update_orderbook("kalshi", "K-A", "A", bids=[], asks=[(0.4, 500)], last_update_ts_utc=now)
         update_orderbook("polymarket", "P-B", "B", bids=[], asks=[(0.5, 500)], last_update_ts_utc=now)
 
-    def test_second_confirm_emits(self) -> None:
+    def test_post_confirm_single_pass_emits(self) -> None:
         event = self._event()
         signal = self._signal("KALSHI:A + POLY:B")
         decision = {"recalculated_edge_bps": 100.0}
@@ -75,47 +75,42 @@ class PostConfirmGateTests(unittest.TestCase):
         signal["detected_ts"] = 1000
         with patch.object(arb_module.time, "time", return_value=2.0):
             result = post_confirm_decision(event, ArbMode.EVENT_OUTCOME, signal, decision, now_ms=2000)
-        self.assertFalse(result["ok"])
-        with patch.object(arb_module.time, "time", return_value=2.0):
-            result = post_confirm_decision(event, ArbMode.EVENT_OUTCOME, signal, decision, now_ms=2200)
         self.assertTrue(result["ok"])
+        self.assertEqual(result["reason"], "confirmed")
 
-    def test_second_confirm_not_window_gated(self) -> None:
+    def test_detected_edge_decay_rejects(self) -> None:
         event = self._event()
         signal = self._signal("KALSHI:A + POLY:B")
         decision = {"recalculated_edge_bps": 100.0}
         now = datetime(2026, 1, 1, tzinfo=timezone.utc)
         with patch.object(arb_module.time, "time", return_value=2.0):
-            self._seed_books(now)
+            # Prices imply negative pnl after fees/slippage, so detected edge decays far below threshold.
+            update_orderbook("kalshi", "K-A", "A", bids=[], asks=[(0.6, 500)], last_update_ts_utc=now)
+            update_orderbook("polymarket", "P-B", "B", bids=[], asks=[(0.7, 500)], last_update_ts_utc=now)
         signal["detected_ts"] = 1000
         with patch.object(arb_module.time, "time", return_value=2.0):
             result = post_confirm_decision(event, ArbMode.EVENT_OUTCOME, signal, decision, now_ms=1000)
         self.assertFalse(result["ok"])
-        with patch.object(arb_module.time, "time", return_value=2.0):
-            result = post_confirm_decision(event, ArbMode.EVENT_OUTCOME, signal, decision, now_ms=2000)
-        self.assertTrue(result["ok"])
+        self.assertIn("edge_decay_exceeded", result["reason"])
 
     def test_edge_decay_rejects(self) -> None:
         event = self._event()
         signal = self._signal("KALSHI:A + POLY:B")
-        first = {"recalculated_edge_bps": 100.0}
-        second = {"recalculated_edge_bps": 50.0}
+        decision = {"recalculated_edge_bps": 50.0}
         now = datetime(2026, 1, 1, tzinfo=timezone.utc)
         with patch.object(arb_module.time, "time", return_value=2.0):
             self._seed_books(now)
         signal["detected_ts"] = 1000
-        with patch.object(arb_module.time, "time", return_value=2.0):
-            result = post_confirm_decision(event, ArbMode.EVENT_OUTCOME, signal, first, now_ms=1000)
-        self.assertFalse(result["ok"])
-        # Worsen the books to force edge decay on the second confirm.
+        # Worsen the books to force edge decay against detected edge.
         worse = datetime(2026, 1, 1, tzinfo=timezone.utc)
         update_orderbook("kalshi", "K-A", "A", bids=[], asks=[(0.6, 500)], last_update_ts_utc=worse)
         update_orderbook("polymarket", "P-B", "B", bids=[], asks=[(0.7, 500)], last_update_ts_utc=worse)
         with patch.object(arb_module.time, "time", return_value=2.0):
-            result = post_confirm_decision(event, ArbMode.EVENT_OUTCOME, signal, second, now_ms=1100)
+            result = post_confirm_decision(event, ArbMode.EVENT_OUTCOME, signal, decision, now_ms=1100)
         self.assertFalse(result["ok"])
+        self.assertIn("edge_decay_exceeded", result["reason"])
 
-    def test_different_fingerprint_is_independent(self) -> None:
+    def test_different_fingerprint_both_single_pass(self) -> None:
         event = self._event()
         signal_a = self._signal("KALSHI:A + POLY:B")
         signal_b = self._signal("POLY:A + KALSHI:B")
@@ -127,10 +122,10 @@ class PostConfirmGateTests(unittest.TestCase):
         signal_b["detected_ts"] = 1000
         with patch.object(arb_module.time, "time", return_value=2.0):
             result = post_confirm_decision(event, ArbMode.EVENT_OUTCOME, signal_a, decision, now_ms=1000)
-        self.assertFalse(result["ok"])
+        self.assertTrue(result["ok"])
         with patch.object(arb_module.time, "time", return_value=2.0):
             result = post_confirm_decision(event, ArbMode.EVENT_OUTCOME, signal_b, decision, now_ms=1100)
-        self.assertFalse(result["ok"])
+        self.assertTrue(result["ok"])
 
     def test_stream_unhealthy_rejects(self) -> None:
         event = self._event()

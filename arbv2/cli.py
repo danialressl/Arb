@@ -27,20 +27,25 @@ from arbv2.pricing.arb import (
     ArbMode,
     CONFIRM_MODE,
     EventMarkets,
+    MAX_SLIPPAGE_BPS,
     ORDERBOOKS,
     Q_MIN,
+    apply_fees,
     confirm_on_trigger,
-    post_confirm_decision,
-    signal_edge_bps,
-    subscribe_orderbook_updates,
-    unsubscribe_orderbook_updates,
     evaluate_paired_metrics,
     evaluate_profit_at_size,
     evaluate_profit_rows,
     find_best_arb,
+    get_fill_stats,
+    post_confirm_decision,
+    signal_edge_bps,
+    subscribe_orderbook_updates,
     should_emit_signal,
+    unsubscribe_orderbook_updates,
 )
 from arbv2.storage import (
+    delete_pending_signal,
+    fetch_pending_signals,
     fetch_markets,
     fetch_match_pairs,
     fetch_predicates,
@@ -50,12 +55,31 @@ from arbv2.storage import (
     insert_arb_scans,
     log_market_stats,
     replace_matches,
+    upsert_pending_signal,
     upsert_markets,
     upsert_predicates,
 )
 
 
 logger = logging.getLogger(__name__)
+EXECUTION_INTENTS_CSV = "arbv2_execution_intents.csv"
+EXECUTION_INTENT_FIELDS = [
+    "type",
+    "event_id",
+    "venues",
+    "markets",
+    "sides",
+    "limit_prices",
+    "size_usd",
+    "edge_bps",
+    "expected_pnl_usd",
+    "detected_ts",
+    "confirmed_at_ts",
+    "time_to_confirm_ms",
+    "signal_duration_ms",
+]
+ACTIVE_CONFIRMED_SIGNALS: Dict[str, Dict[str, object]] = {}
+PENDING_SIGNALS_HYDRATED = False
 
 
 def _purge_db_files(db_path: str) -> None:
@@ -610,6 +634,7 @@ def _scan_arb_events(
     mode: ArbMode,
     title_by_market_id: Dict[str, str],
 ) -> None:
+    _backfill_execution_intent_durations(db_path, EXECUTION_INTENTS_CSV)
     scan_rows: List[tuple] = []
     latest_by_key: Dict[tuple, tuple] = {}
     for event in events:
@@ -681,7 +706,8 @@ def _scan_arb_events(
                 continue
             intent = _build_execution_intent(signal, post_decision)
             logger.info("EXECUTION_INTENT %s", json.dumps(intent, separators=(",", ":")))
-            _append_execution_intent_csv(intent, "arbv2_execution_intents.csv")
+            _append_execution_intent_csv(intent, EXECUTION_INTENTS_CSV)
+            _track_confirmed_signal(db_path, signal, intent, EXECUTION_INTENTS_CSV)
             _log_signal_details(signal)
             continue
         _append_arb_csv(signal, "arbv2_arbs.csv")
@@ -720,6 +746,11 @@ def _log_signal_details(signal: Dict[str, object]) -> None:
 
 def _build_execution_intent(signal: Dict[str, object], decision: Dict[str, object]) -> Dict[str, object]:
     legs = signal.get("legs") or []
+    confirmed_at_ts = int(time.time() * 1000)
+    detected_ts = _as_int(signal.get("detected_ts"))
+    time_to_confirm_ms = None
+    if detected_ts is not None:
+        time_to_confirm_ms = confirmed_at_ts - detected_ts
     return {
         "type": "EXECUTION_INTENT",
         "event_id": signal.get("event_id"),
@@ -730,12 +761,159 @@ def _build_execution_intent(signal: Dict[str, object], decision: Dict[str, objec
         "size_usd": signal.get("size"),
         "edge_bps": decision.get("recalculated_edge_bps") or decision.get("edge_bps"),
         "expected_pnl_usd": decision.get("expected_pnl_usd"),
-        "confirmed_at_ts": int(time.time() * 1000),
+        "detected_ts": detected_ts,
+        "confirmed_at_ts": confirmed_at_ts,
+        "time_to_confirm_ms": time_to_confirm_ms,
+        "signal_duration_ms": None,
     }
 
 
 def _append_execution_intent_csv(intent: Dict[str, object], csv_path: str) -> None:
-    row = {
+    rows = _read_execution_intent_rows(csv_path)
+    rows.append(_execution_intent_row(intent))
+    _write_execution_intent_rows(csv_path, rows)
+
+
+def _track_confirmed_signal(db_path: str, signal: Dict[str, object], intent: Dict[str, object], csv_path: str) -> None:
+    size_usd = _as_float(signal.get("size"))
+    detected_ts = _as_int(intent.get("detected_ts"))
+    confirmed_at_ts = _as_int(intent.get("confirmed_at_ts"))
+    if size_usd is None or size_usd <= 0 or detected_ts is None or confirmed_at_ts is None:
+        return
+    legs = signal.get("legs") or []
+    normalized_legs: List[Dict[str, object]] = []
+    for leg in legs:
+        venue = str(leg.get("venue") or "")
+        market_id = str(leg.get("market_id") or "")
+        outcome_label = str(leg.get("outcome_label") or "")
+        side = str(leg.get("side") or "YES")
+        if not venue or not market_id or not outcome_label:
+            continue
+        normalized_legs.append(
+            {
+                "venue": venue,
+                "market_id": market_id,
+                "outcome_label": outcome_label,
+                "side": side,
+            }
+        )
+    if not normalized_legs:
+        return
+    key = _execution_intent_key(intent)
+    ACTIVE_CONFIRMED_SIGNALS[key] = {
+        "intent": dict(intent),
+        "legs": normalized_legs,
+        "size_usd": size_usd,
+        "detected_ts": detected_ts,
+        "confirmed_at_ts": confirmed_at_ts,
+        "csv_path": csv_path,
+    }
+    upsert_pending_signal(db_path, key, ACTIVE_CONFIRMED_SIGNALS[key])
+
+
+def _hydrate_pending_signals(db_path: str) -> None:
+    global PENDING_SIGNALS_HYDRATED
+    if PENDING_SIGNALS_HYDRATED:
+        return
+    for key, payload in fetch_pending_signals(db_path):
+        if key and isinstance(payload, dict):
+            ACTIVE_CONFIRMED_SIGNALS[key] = payload
+    PENDING_SIGNALS_HYDRATED = True
+
+
+def _backfill_execution_intent_durations(db_path: str, csv_path: str) -> None:
+    _hydrate_pending_signals(db_path)
+    if not ACTIVE_CONFIRMED_SIGNALS:
+        return
+    now_ms = int(time.time() * 1000)
+    completed_keys: List[str] = []
+    for key, tracked in list(ACTIVE_CONFIRMED_SIGNALS.items()):
+        legs = tracked.get("legs") or []
+        size_usd = _as_float(tracked.get("size_usd"))
+        detected_ts = _as_int(tracked.get("detected_ts"))
+        if not legs or size_usd is None or size_usd <= 0 or detected_ts is None:
+            continue
+        pnl = _reprice_signal_pnl(legs, size_usd)
+        if pnl is None or pnl > 0:
+            continue
+        intent = dict(tracked.get("intent") or {})
+        intent["signal_duration_ms"] = now_ms - detected_ts
+        _replace_execution_intent_csv_row(csv_path, intent)
+        logger.info(
+            "EXECUTION_INTENT_COMPLETE event_id=%s confirmed_at_ts=%s signal_duration_ms=%s",
+            intent.get("event_id"),
+            intent.get("confirmed_at_ts"),
+            intent.get("signal_duration_ms"),
+        )
+        completed_keys.append(key)
+    for key in completed_keys:
+        ACTIVE_CONFIRMED_SIGNALS.pop(key, None)
+        delete_pending_signal(db_path, key)
+
+
+def _reprice_signal_pnl(legs: List[Dict[str, object]], size_usd: float) -> Optional[float]:
+    eff_prices: List[float] = []
+    for leg in legs:
+        venue = str(leg.get("venue") or "")
+        market_id = str(leg.get("market_id") or "")
+        outcome_label = str(leg.get("outcome_label") or "")
+        side = str(leg.get("side") or "YES")
+        if not venue or not market_id or not outcome_label:
+            return None
+        stats = get_fill_stats(venue, market_id, outcome_label, side, size_usd)
+        if not stats.get("ok"):
+            return None
+        eff_price = apply_fees(venue, stats.get("vwap_price"), size_usd)
+        if eff_price is None:
+            return None
+        eff_price *= 1 + (MAX_SLIPPAGE_BPS / 10_000)
+        eff_prices.append(eff_price)
+    total_cost = size_usd * sum(eff_prices)
+    return size_usd - total_cost
+
+
+def _replace_execution_intent_csv_row(csv_path: str, intent: Dict[str, object]) -> None:
+    target = _execution_intent_row(intent)
+    rows = _read_execution_intent_rows(csv_path)
+    replaced = False
+    for idx, row in enumerate(rows):
+        if (
+            str(row.get("type") or "") == str(target.get("type") or "")
+            and str(row.get("event_id") or "") == str(target.get("event_id") or "")
+            and str(row.get("confirmed_at_ts") or "") == str(target.get("confirmed_at_ts") or "")
+            and str(row.get("markets") or "") == str(target.get("markets") or "")
+            and str(row.get("sides") or "") == str(target.get("sides") or "")
+        ):
+            rows[idx] = target
+            replaced = True
+            break
+    if not replaced:
+        rows.append(target)
+    _write_execution_intent_rows(csv_path, rows)
+
+
+def _read_execution_intent_rows(csv_path: str) -> List[Dict[str, object]]:
+    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+        return []
+    rows: List[Dict[str, object]] = []
+    with open(csv_path, newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            normalized = {field: row.get(field, "") for field in EXECUTION_INTENT_FIELDS}
+            rows.append(normalized)
+    return rows
+
+
+def _write_execution_intent_rows(csv_path: str, rows: List[Dict[str, object]]) -> None:
+    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=EXECUTION_INTENT_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in EXECUTION_INTENT_FIELDS})
+
+
+def _execution_intent_row(intent: Dict[str, object]) -> Dict[str, object]:
+    return {
         "type": intent.get("type"),
         "event_id": intent.get("event_id"),
         "venues": json.dumps(intent.get("venues") or [], separators=(",", ":")),
@@ -745,14 +923,37 @@ def _append_execution_intent_csv(intent: Dict[str, object], csv_path: str) -> No
         "size_usd": intent.get("size_usd"),
         "edge_bps": intent.get("edge_bps"),
         "expected_pnl_usd": intent.get("expected_pnl_usd"),
+        "detected_ts": intent.get("detected_ts"),
         "confirmed_at_ts": intent.get("confirmed_at_ts"),
+        "time_to_confirm_ms": intent.get("time_to_confirm_ms"),
+        "signal_duration_ms": intent.get("signal_duration_ms"),
     }
-    write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
-    with open(csv_path, "a", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(row.keys()))
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+
+
+def _execution_intent_key(intent: Dict[str, object]) -> str:
+    event_id = str(intent.get("event_id") or "")
+    confirmed_at_ts = str(intent.get("confirmed_at_ts") or "")
+    markets = json.dumps(intent.get("markets") or [], separators=(",", ":"))
+    sides = json.dumps(intent.get("sides") or [], separators=(",", ":"))
+    return "|".join([event_id, confirmed_at_ts, markets, sides])
+
+
+def _as_int(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_float(value: object) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _append_confirm_rejection_csv(
