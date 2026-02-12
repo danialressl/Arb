@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -10,6 +11,7 @@ from arbv2.teams import canonicalize_team, league_hint_from_series_ticker, leagu
 
 
 logger = logging.getLogger(__name__)
+_DB_WRITE_LOCK = threading.RLock()
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS markets (
@@ -79,183 +81,192 @@ CREATE TABLE IF NOT EXISTS pending_signals (
 
 
 def _connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30.0)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     return conn
 
 
 def init_db(db_path: str) -> None:
-    conn = _connect(db_path)
-    try:
-        conn.executescript(SCHEMA)
-        _migrate_markets_schema(conn)
-        _migrate_predicates_schema(conn)
-        _migrate_matches_schema(conn)
-        _migrate_prices_schema(conn)
-        _migrate_arb_scans_schema(conn)
-        conn.commit()
-    finally:
-        conn.close()
+    with _DB_WRITE_LOCK:
+        conn = _connect(db_path)
+        try:
+            conn.executescript(SCHEMA)
+            _migrate_markets_schema(conn)
+            _migrate_predicates_schema(conn)
+            _migrate_matches_schema(conn)
+            _migrate_prices_schema(conn)
+            _migrate_arb_scans_schema(conn)
+            conn.commit()
+        finally:
+            conn.close()
     backfill_market_fields(db_path)
 
 
 def upsert_markets(db_path: str, markets: Iterable[Market]) -> None:
-    conn = _connect(db_path)
-    try:
-        conn.executemany(
-            """
-            INSERT INTO markets (
-                venue, market_id, event_id, series_ticker, title, event_title,
-                market_type, status, event_date, outcome_label, raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(venue, market_id) DO UPDATE SET
-                event_id=excluded.event_id,
-                series_ticker=excluded.series_ticker,
-                title=excluded.title,
-                event_title=excluded.event_title,
-                market_type=excluded.market_type,
-                status=excluded.status,
-                event_date=excluded.event_date,
-                outcome_label=excluded.outcome_label,
-                raw_json=excluded.raw_json
-            """,
-            [
-                (
-                    m.venue,
-                    m.market_id,
-                    m.event_id,
-                    m.series_ticker,
-                    m.title,
-                    m.event_title,
-                    m.market_type,
-                    m.status,
-                    m.event_date,
-                    m.outcome_label,
-                    json.dumps(m.raw_json),
-                )
-                for m in markets
-            ],
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    with _DB_WRITE_LOCK:
+        conn = _connect(db_path)
+        try:
+            conn.executemany(
+                """
+                INSERT INTO markets (
+                    venue, market_id, event_id, series_ticker, title, event_title,
+                    market_type, status, event_date, outcome_label, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(venue, market_id) DO UPDATE SET
+                    event_id=excluded.event_id,
+                    series_ticker=excluded.series_ticker,
+                    title=excluded.title,
+                    event_title=excluded.event_title,
+                    market_type=excluded.market_type,
+                    status=excluded.status,
+                    event_date=excluded.event_date,
+                    outcome_label=excluded.outcome_label,
+                    raw_json=excluded.raw_json
+                """,
+                [
+                    (
+                        m.venue,
+                        m.market_id,
+                        m.event_id,
+                        m.series_ticker,
+                        m.title,
+                        m.event_title,
+                        m.market_type,
+                        m.status,
+                        m.event_date,
+                        m.outcome_label,
+                        json.dumps(m.raw_json),
+                    )
+                    for m in markets
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def upsert_predicates(db_path: str, predicates: Iterable[SportsPredicate]) -> None:
-    conn = _connect(db_path)
-    try:
-        conn.executemany(
-            """
-            INSERT INTO predicates (
-                venue, market_id, event_id, team_a, team_b, winner
-            ) VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(venue, market_id) DO UPDATE SET
-                event_id=excluded.event_id,
-                team_a=excluded.team_a,
-                team_b=excluded.team_b,
-                winner=excluded.winner
-            """,
-            [
-                (
-                    p.venue,
-                    p.market_id,
-                    p.event_id,
-                    p.team_a,
-                    p.team_b,
-                    p.winner,
-                )
-                for p in predicates
-            ],
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    with _DB_WRITE_LOCK:
+        conn = _connect(db_path)
+        try:
+            conn.executemany(
+                """
+                INSERT INTO predicates (
+                    venue, market_id, event_id, team_a, team_b, winner
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(venue, market_id) DO UPDATE SET
+                    event_id=excluded.event_id,
+                    team_a=excluded.team_a,
+                    team_b=excluded.team_b,
+                    winner=excluded.winner
+                """,
+                [
+                    (
+                        p.venue,
+                        p.market_id,
+                        p.event_id,
+                        p.team_a,
+                        p.team_b,
+                        p.winner,
+                    )
+                    for p in predicates
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def replace_matches(db_path: str, matches: Iterable[MatchResult]) -> None:
-    conn = _connect(db_path)
-    try:
-        conn.execute("DELETE FROM matches")
-        conn.executemany(
-            """
-            INSERT INTO matches (
-                kalshi_market_id, polymarket_market_id, reason, kalshi_title, polymarket_title
-            ) VALUES (?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    m.kalshi_market_id,
-                    m.polymarket_market_id,
-                    m.reason,
-                    m.kalshi_title,
-                    m.polymarket_title,
-                )
-                for m in matches
-            ],
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    with _DB_WRITE_LOCK:
+        conn = _connect(db_path)
+        try:
+            conn.execute("DELETE FROM matches")
+            conn.executemany(
+                """
+                INSERT INTO matches (
+                    kalshi_market_id, polymarket_market_id, reason, kalshi_title, polymarket_title
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        m.kalshi_market_id,
+                        m.polymarket_market_id,
+                        m.reason,
+                        m.kalshi_title,
+                        m.polymarket_title,
+                    )
+                    for m in matches
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def insert_prices(db_path: str, snapshots: Iterable[PriceSnapshot]) -> None:
-    conn = _connect(db_path)
-    try:
-        conn.executemany(
-            """
-            INSERT INTO prices (
-                venue, market_id, outcome_label, best_bid, best_ask, last_trade, ts_utc, raw_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(venue, market_id, outcome_label) DO UPDATE SET
-                best_bid=excluded.best_bid,
-                best_ask=excluded.best_ask,
-                last_trade=excluded.last_trade,
-                ts_utc=excluded.ts_utc,
-                raw_json=excluded.raw_json
-            """,
-            [
-                (
-                    snap.venue,
-                    snap.market_id,
-                    snap.outcome_label,
-                    snap.best_bid,
-                    snap.best_ask,
-                    snap.last_trade,
-                    snap.ts_utc,
-                    json.dumps(snap.raw_json) if snap.raw_json is not None else None,
-                )
-                for snap in snapshots
-            ],
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    with _DB_WRITE_LOCK:
+        conn = _connect(db_path)
+        try:
+            conn.executemany(
+                """
+                INSERT INTO prices (
+                    venue, market_id, outcome_label, best_bid, best_ask, last_trade, ts_utc, raw_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(venue, market_id, outcome_label) DO UPDATE SET
+                    best_bid=excluded.best_bid,
+                    best_ask=excluded.best_ask,
+                    last_trade=excluded.last_trade,
+                    ts_utc=excluded.ts_utc,
+                    raw_json=excluded.raw_json
+                """,
+                [
+                    (
+                        snap.venue,
+                        snap.market_id,
+                        snap.outcome_label,
+                        snap.best_bid,
+                        snap.best_ask,
+                        snap.last_trade,
+                        snap.ts_utc,
+                        json.dumps(snap.raw_json) if snap.raw_json is not None else None,
+                    )
+                    for snap in snapshots
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def insert_arb_scans(db_path: str, rows: Iterable[tuple]) -> None:
-    conn = _connect(db_path)
-    try:
-        rows_list = list(rows)
-        if not rows_list:
-            return
-        conn.executemany(
-            """
-            DELETE FROM arb_scans
-            WHERE arb_type=? AND kalshi_market_id=? AND polymarket_market_id=?
-            """,
-            [(r[0], r[1], r[2]) for r in rows_list],
-        )
-        conn.executemany(
-            """
-            INSERT INTO arb_scans (
-                arb_type, kalshi_market_id, polymarket_market_id, expected_profit, ts_utc, event_id, size, event_title
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows_list,
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    with _DB_WRITE_LOCK:
+        conn = _connect(db_path)
+        try:
+            rows_list = list(rows)
+            if not rows_list:
+                return
+            conn.executemany(
+                """
+                DELETE FROM arb_scans
+                WHERE arb_type=? AND kalshi_market_id=? AND polymarket_market_id=?
+                """,
+                [(r[0], r[1], r[2]) for r in rows_list],
+            )
+            conn.executemany(
+                """
+                INSERT INTO arb_scans (
+                    arb_type, kalshi_market_id, polymarket_market_id, expected_profit, ts_utc, event_id, size, event_title
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                rows_list,
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def upsert_pending_signal(
@@ -265,23 +276,24 @@ def upsert_pending_signal(
     *,
     now_ms: Optional[int] = None,
 ) -> None:
-    conn = _connect(db_path)
-    try:
-        ts = int(now_ms if now_ms is not None else datetime.now(timezone.utc).timestamp() * 1000)
-        payload_json = json.dumps(payload, separators=(",", ":"))
-        conn.execute(
-            """
-            INSERT INTO pending_signals (signal_key, payload_json, created_ts, updated_ts)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(signal_key) DO UPDATE SET
-                payload_json=excluded.payload_json,
-                updated_ts=excluded.updated_ts
-            """,
-            (signal_key, payload_json, ts, ts),
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    with _DB_WRITE_LOCK:
+        conn = _connect(db_path)
+        try:
+            ts = int(now_ms if now_ms is not None else datetime.now(timezone.utc).timestamp() * 1000)
+            payload_json = json.dumps(payload, separators=(",", ":"))
+            conn.execute(
+                """
+                INSERT INTO pending_signals (signal_key, payload_json, created_ts, updated_ts)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(signal_key) DO UPDATE SET
+                    payload_json=excluded.payload_json,
+                    updated_ts=excluded.updated_ts
+                """,
+                (signal_key, payload_json, ts, ts),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
 
 def fetch_pending_signals(db_path: str) -> List[Tuple[str, Dict[str, Any]]]:
@@ -308,12 +320,51 @@ def fetch_pending_signals(db_path: str) -> List[Tuple[str, Dict[str, Any]]]:
 
 
 def delete_pending_signal(db_path: str, signal_key: str) -> None:
-    conn = _connect(db_path)
-    try:
-        conn.execute("DELETE FROM pending_signals WHERE signal_key=?", (signal_key,))
-        conn.commit()
-    finally:
-        conn.close()
+    with _DB_WRITE_LOCK:
+        conn = _connect(db_path)
+        try:
+            conn.execute("DELETE FROM pending_signals WHERE signal_key=?", (signal_key,))
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def prune_orphaned_runtime_rows(db_path: str) -> Dict[str, int]:
+    with _DB_WRITE_LOCK:
+        conn = _connect(db_path)
+        try:
+            before = conn.total_changes
+            conn.execute(
+                """
+                DELETE FROM prices
+                WHERE
+                    (venue='kalshi' AND NOT EXISTS (
+                        SELECT 1 FROM matches m WHERE m.kalshi_market_id = prices.market_id
+                    ))
+                    OR
+                    (venue='polymarket' AND NOT EXISTS (
+                        SELECT 1 FROM matches m WHERE m.polymarket_market_id = prices.market_id
+                    ))
+                """
+            )
+            prices_deleted = conn.total_changes - before
+
+            before = conn.total_changes
+            conn.execute(
+                """
+                DELETE FROM arb_scans
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM matches m
+                    WHERE m.kalshi_market_id = arb_scans.kalshi_market_id
+                      AND m.polymarket_market_id = arb_scans.polymarket_market_id
+                )
+                """
+            )
+            scans_deleted = conn.total_changes - before
+            conn.commit()
+            return {"prices_deleted": prices_deleted, "arb_scans_deleted": scans_deleted}
+        finally:
+            conn.close()
 
 
 def fetch_markets(db_path: str, venue: Optional[str] = None) -> List[Market]:
@@ -450,43 +501,44 @@ def _migrate_markets_schema(conn: sqlite3.Connection) -> None:
 
 
 def backfill_market_fields(db_path: str) -> None:
-    conn = _connect(db_path)
-    try:
-        rows = conn.execute(
-            """
-            SELECT venue, market_id, raw_json, market_type, status, event_date, outcome_label
-            FROM markets
-            WHERE market_type IS NULL OR status IS NULL OR event_date IS NULL OR outcome_label IS NULL
-            """
-        ).fetchall()
-        updates: List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], str, str]] = []
-        for row in rows:
-            raw_json = json.loads(row["raw_json"]) if row["raw_json"] else {}
-            market_type = row["market_type"]
-            status = row["status"]
-            event_date = row["event_date"]
-            outcome_label = row["outcome_label"]
-            if not market_type:
-                market_type = "sports_moneyline"
-            if not status:
-                status = _normalize_status(row["venue"], raw_json)
-            if not event_date:
-                event_date = _extract_event_date(row["venue"], raw_json)
-            if not outcome_label:
-                outcome_label = _extract_outcome_label(row["venue"], raw_json)
-            updates.append((market_type, status, event_date, outcome_label, row["venue"], row["market_id"]))
-        if updates:
-            conn.executemany(
+    with _DB_WRITE_LOCK:
+        conn = _connect(db_path)
+        try:
+            rows = conn.execute(
                 """
-                UPDATE markets
-                SET market_type=?, status=?, event_date=?, outcome_label=?
-                WHERE venue=? AND market_id=?
-                """,
-                updates,
-            )
-            conn.commit()
-    finally:
-        conn.close()
+                SELECT venue, market_id, raw_json, market_type, status, event_date, outcome_label
+                FROM markets
+                WHERE market_type IS NULL OR status IS NULL OR event_date IS NULL OR outcome_label IS NULL
+                """
+            ).fetchall()
+            updates: List[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], str, str]] = []
+            for row in rows:
+                raw_json = json.loads(row["raw_json"]) if row["raw_json"] else {}
+                market_type = row["market_type"]
+                status = row["status"]
+                event_date = row["event_date"]
+                outcome_label = row["outcome_label"]
+                if not market_type:
+                    market_type = "sports_moneyline"
+                if not status:
+                    status = _normalize_status(row["venue"], raw_json)
+                if not event_date:
+                    event_date = _extract_event_date(row["venue"], raw_json)
+                if not outcome_label:
+                    outcome_label = _extract_outcome_label(row["venue"], raw_json)
+                updates.append((market_type, status, event_date, outcome_label, row["venue"], row["market_id"]))
+            if updates:
+                conn.executemany(
+                    """
+                    UPDATE markets
+                    SET market_type=?, status=?, event_date=?, outcome_label=?
+                    WHERE venue=? AND market_id=?
+                    """,
+                    updates,
+                )
+                conn.commit()
+        finally:
+            conn.close()
 
 
 def log_market_stats(db_path: str) -> None:

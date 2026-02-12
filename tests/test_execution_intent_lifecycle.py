@@ -14,7 +14,7 @@ class ExecutionIntentLifecycleTests(unittest.TestCase):
     def setUp(self) -> None:
         ORDERBOOKS.clear()
         cli_module.ACTIVE_CONFIRMED_SIGNALS.clear()
-        cli_module.PENDING_SIGNALS_HYDRATED = False
+        cli_module.PENDING_SIGNALS_HYDRATED_DB = None
 
     def _seed_books(self, kalshi_ask: float, polymarket_ask: float) -> None:
         now = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -48,7 +48,7 @@ class ExecutionIntentLifecycleTests(unittest.TestCase):
             self.assertEqual(len(fetch_pending_signals(db_path)), 1)
             # Simulate process restart.
             cli_module.ACTIVE_CONFIRMED_SIGNALS.clear()
-            cli_module.PENDING_SIGNALS_HYDRATED = False
+            cli_module.PENDING_SIGNALS_HYDRATED_DB = None
 
             with open(csv_path, newline="", encoding="utf-8") as handle:
                 rows = list(csv.DictReader(handle))

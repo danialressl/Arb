@@ -4,7 +4,9 @@ import csv
 import json
 import logging
 import os
+import sqlite3
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -54,6 +56,7 @@ from arbv2.storage import (
     insert_prices,
     insert_arb_scans,
     log_market_stats,
+    prune_orphaned_runtime_rows,
     replace_matches,
     upsert_pending_signal,
     upsert_markets,
@@ -64,6 +67,7 @@ from arbv2.storage import (
 logger = logging.getLogger(__name__)
 EXECUTION_INTENTS_CSV = "arbv2_execution_intents.csv"
 EXECUTION_INTENT_FIELDS = [
+    "intent_id",
     "type",
     "event_id",
     "venues",
@@ -79,7 +83,7 @@ EXECUTION_INTENT_FIELDS = [
     "signal_duration_ms",
 ]
 ACTIVE_CONFIRMED_SIGNALS: Dict[str, Dict[str, object]] = {}
-PENDING_SIGNALS_HYDRATED = False
+PENDING_SIGNALS_HYDRATED_DB: Optional[str] = None
 
 
 def _purge_db_files(db_path: str) -> None:
@@ -108,6 +112,7 @@ def main() -> int:
     ingest_parser.add_argument("--limit", type=int, default=None)
 
     sub.add_parser("match", help="Parse predicates and match markets")
+    sub.add_parser("health", help="Show runtime DB/CSV health metrics")
 
     debug_parser = sub.add_parser("debug", help="Debug a pair")
     debug_parser.add_argument("kalshi_market_id")
@@ -160,6 +165,8 @@ def main() -> int:
         return _run_ingest(config, args.kalshi, args.polymarket)
     if args.cmd == "match":
         return _run_match(config)
+    if args.cmd == "health":
+        return _run_health(config)
     if args.cmd == "debug":
         return _run_debug(config, args.kalshi_market_id, args.polymarket_market_id)
     if args.cmd == "price":
@@ -210,11 +217,144 @@ def _run_match(config) -> int:
         subset_matching=config.subset_matching_enabled,
     )
     replace_matches(config.db_path, matches)
+    pruned = prune_orphaned_runtime_rows(config.db_path)
+    if pruned["prices_deleted"] or pruned["arb_scans_deleted"]:
+        logger.info(
+            "Pruned orphaned rows prices=%d arb_scans=%d",
+            pruned["prices_deleted"],
+            pruned["arb_scans_deleted"],
+        )
 
     logger.info("Predicates parsed: kalshi=%d polymarket=%d", len(kalshi_preds), len(poly_preds))
     logger.info("Matches found: %d", len(matches))
     _log_match_stats(kalshi_markets, poly_markets, kalshi_preds, poly_preds, matches)
     return 0
+
+
+def _run_health(config) -> int:
+    init_db(config.db_path)
+    conn = sqlite3.connect(config.db_path)
+    try:
+        cur = conn.cursor()
+        counts = {
+            "matches": _fetch_scalar(cur, "SELECT COUNT(*) FROM matches"),
+            "kalshi_markets": _fetch_scalar(cur, "SELECT COUNT(*) FROM markets WHERE venue='kalshi'"),
+            "poly_markets": _fetch_scalar(cur, "SELECT COUNT(*) FROM markets WHERE venue='polymarket'"),
+            "kalshi_prices": _fetch_scalar(cur, "SELECT COUNT(*) FROM prices WHERE venue='kalshi'"),
+            "poly_prices": _fetch_scalar(cur, "SELECT COUNT(*) FROM prices WHERE venue='polymarket'"),
+            "arb_scans": _fetch_scalar(cur, "SELECT COUNT(*) FROM arb_scans"),
+            "pending_signals": _fetch_scalar(cur, "SELECT COUNT(*) FROM pending_signals"),
+        }
+        latest = {
+            "kalshi_prices_latest_ts": _fetch_scalar(cur, "SELECT MAX(ts_utc) FROM prices WHERE venue='kalshi'"),
+            "poly_prices_latest_ts": _fetch_scalar(cur, "SELECT MAX(ts_utc) FROM prices WHERE venue='polymarket'"),
+            "arb_scans_latest_ts": _fetch_scalar(cur, "SELECT MAX(ts_utc) FROM arb_scans"),
+            "pending_signals_latest_ts": _fetch_scalar(cur, "SELECT MAX(updated_ts) FROM pending_signals"),
+        }
+        orphan_counts = {
+            "orphan_prices": _fetch_scalar(
+                cur,
+                """
+                SELECT COUNT(*) FROM prices p
+                WHERE
+                    (p.venue='kalshi' AND NOT EXISTS (SELECT 1 FROM matches m WHERE m.kalshi_market_id=p.market_id))
+                    OR
+                    (p.venue='polymarket' AND NOT EXISTS (SELECT 1 FROM matches m WHERE m.polymarket_market_id=p.market_id))
+                """,
+            ),
+            "orphan_arb_scans": _fetch_scalar(
+                cur,
+                """
+                SELECT COUNT(*) FROM arb_scans a
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM matches m
+                    WHERE m.kalshi_market_id=a.kalshi_market_id
+                      AND m.polymarket_market_id=a.polymarket_market_id
+                )
+                """,
+            ),
+        }
+        coverage = {
+            "matched_pairs_with_both_prices": _fetch_scalar(
+                cur,
+                """
+                SELECT COUNT(*) FROM (
+                    SELECT DISTINCT m.kalshi_market_id, m.polymarket_market_id
+                    FROM matches m
+                    WHERE EXISTS (SELECT 1 FROM prices pk WHERE pk.venue='kalshi' AND pk.market_id=m.kalshi_market_id)
+                      AND EXISTS (SELECT 1 FROM prices pp WHERE pp.venue='polymarket' AND pp.market_id=m.polymarket_market_id)
+                )
+                """,
+            ),
+            "scan_pairs_present": _fetch_scalar(
+                cur,
+                "SELECT COUNT(*) FROM (SELECT DISTINCT kalshi_market_id, polymarket_market_id FROM arb_scans)",
+            ),
+        }
+    finally:
+        conn.close()
+
+    durations = _execution_intent_duration_stats(EXECUTION_INTENTS_CSV)
+    logger.info("HEALTH counts=%s", counts)
+    logger.info("HEALTH latest=%s", latest)
+    logger.info("HEALTH orphans=%s", orphan_counts)
+    logger.info("HEALTH coverage=%s", coverage)
+    logger.info("HEALTH execution_intents=%s", durations)
+    return 0
+
+
+def _fetch_scalar(cur: sqlite3.Cursor, query: str):
+    row = cur.execute(query).fetchone()
+    if not row:
+        return None
+    return row[0]
+
+
+def _execution_intent_duration_stats(csv_path: str) -> Dict[str, object]:
+    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+        return {
+            "rows_total": 0,
+            "durations_nonblank": 0,
+            "durations_blank": 0,
+        }
+    with open(csv_path, newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    durations: List[float] = []
+    for row in rows:
+        value = (row.get("signal_duration_ms") or "").strip()
+        if not value:
+            continue
+        try:
+            durations.append(float(value))
+        except ValueError:
+            continue
+    out: Dict[str, object] = {
+        "rows_total": len(rows),
+        "durations_nonblank": len(durations),
+        "durations_blank": len(rows) - len(durations),
+    }
+    if not durations:
+        return out
+    sorted_values = sorted(durations)
+
+    def percentile(q: float) -> float:
+        idx = int((len(sorted_values) - 1) * q)
+        return sorted_values[idx]
+
+    out.update(
+        {
+            "duration_ms_min": min(sorted_values),
+            "duration_ms_p50": percentile(0.5),
+            "duration_ms_p90": percentile(0.9),
+            "duration_ms_p99": percentile(0.99),
+            "duration_ms_max": max(sorted_values),
+            "duration_ge_100ms": sum(1 for x in sorted_values if x >= 100),
+            "duration_ge_500ms": sum(1 for x in sorted_values if x >= 500),
+            "duration_ge_1000ms": sum(1 for x in sorted_values if x >= 1000),
+            "duration_ge_5000ms": sum(1 for x in sorted_values if x >= 5000),
+        }
+    )
+    return out
 
 
 def _run_loop(config, interval_seconds: int) -> int:
@@ -411,6 +551,7 @@ async def _run_price_streams(
     if kalshi_markets:
         tasks.append(asyncio.create_task(stream_kalshi_books(config, kalshi_markets, config.db_path)))
     tasks.append(asyncio.create_task(_run_arb_stream(config)))
+    tasks.append(asyncio.create_task(_run_intent_backfill_loop(config.db_path, EXECUTION_INTENTS_CSV)))
     tasks.append(asyncio.create_task(_loop_heartbeat("price_streams")))
     if not tasks:
         return
@@ -437,6 +578,7 @@ def _find_market(config, venue: str, market_id: str) -> Optional[Market]:
 async def _run_arb_stream(config) -> None:
     kalshi_markets = fetch_markets(config.db_path, venue="kalshi")
     poly_markets = fetch_markets(config.db_path, venue="polymarket")
+    matched_pairs = set(fetch_match_pairs(config.db_path))
     title_by_market_id = _title_by_market_id(kalshi_markets + poly_markets)
     kalshi_preds = _parse_all(kalshi_markets)
     poly_preds = _parse_all(poly_markets)
@@ -452,6 +594,7 @@ async def _run_arb_stream(config) -> None:
         events_event,
         events_binary,
         title_by_market_id,
+        matched_pairs,
     )
 
     loop = asyncio.get_running_loop()
@@ -505,6 +648,7 @@ async def _run_arb_stream(config) -> None:
                 scan_event,
                 scan_binary,
                 title_by_market_id,
+                matched_pairs,
             )
     finally:
         unsubscribe_orderbook_updates(subscriber_token)
@@ -515,9 +659,10 @@ def _scan_arb_cycle(
     events_event: List[EventMarkets],
     events_binary: List[EventMarkets],
     title_by_market_id: Dict[str, str],
+    matched_pairs: Optional[Set[Tuple[str, str]]] = None,
 ) -> None:
-    _scan_arb_events(db_path, events_event, ArbMode.EVENT_OUTCOME, title_by_market_id)
-    _scan_arb_events(db_path, events_binary, ArbMode.BINARY_MIRROR, title_by_market_id)
+    _scan_arb_events(db_path, events_event, ArbMode.EVENT_OUTCOME, title_by_market_id, matched_pairs)
+    _scan_arb_events(db_path, events_binary, ArbMode.BINARY_MIRROR, title_by_market_id, matched_pairs)
 
 
 def _index_events_by_leg(events: List[EventMarkets]) -> Dict[Tuple[str, str], List[EventMarkets]]:
@@ -561,6 +706,12 @@ async def _loop_heartbeat(name: str, *, interval: float = 5.0, warn_threshold: f
         if drift > warn_threshold:
             logger.warning("Event loop lag %s drift=%.3fs", name, drift)
         next_ts = now + interval
+
+
+async def _run_intent_backfill_loop(db_path: str, csv_path: str, *, interval_seconds: float = 1.0) -> None:
+    while True:
+        await asyncio.to_thread(_backfill_execution_intent_durations, db_path, csv_path)
+        await asyncio.sleep(interval_seconds)
 
 
 def _run_live(config, args) -> int:
@@ -609,13 +760,13 @@ async def _run_live_loop(
             enable_kalshi=enable_kalshi,
             limit=limit,
         )
-        ORDERBOOKS.clear()
         tasks = []
         if enable_polymarket and poly_token_map:
             tasks.append(asyncio.create_task(stream_poly_books(config, poly_token_map, config.db_path)))
         if enable_kalshi and kalshi_markets:
             tasks.append(asyncio.create_task(stream_kalshi_books(config, kalshi_markets, config.db_path)))
         tasks.append(asyncio.create_task(_run_arb_stream(config)))
+        tasks.append(asyncio.create_task(_run_intent_backfill_loop(config.db_path, EXECUTION_INTENTS_CSV)))
         if not tasks:
             logger.warning("No price streams to run; sleeping %d seconds", interval_seconds)
             await asyncio.sleep(interval_seconds)
@@ -633,6 +784,7 @@ def _scan_arb_events(
     events: List[EventMarkets],
     mode: ArbMode,
     title_by_market_id: Dict[str, str],
+    matched_pairs: Optional[Set[Tuple[str, str]]] = None,
 ) -> None:
     _backfill_execution_intent_durations(db_path, EXECUTION_INTENTS_CSV)
     scan_rows: List[tuple] = []
@@ -649,6 +801,8 @@ def _scan_arb_events(
                 if leg.get("venue") == "polymarket" and not polymarket_market_id:
                     polymarket_market_id = leg.get("market_id")
             if kalshi_market_id and polymarket_market_id:
+                if matched_pairs is not None and (kalshi_market_id, polymarket_market_id) not in matched_pairs:
+                    continue
                 event_title = title_by_market_id.get(kalshi_market_id) or title_by_market_id.get(polymarket_market_id)
                 key = (metrics["arb_type"], kalshi_market_id, polymarket_market_id)
                 latest_by_key[key] = (
@@ -747,11 +901,13 @@ def _log_signal_details(signal: Dict[str, object]) -> None:
 def _build_execution_intent(signal: Dict[str, object], decision: Dict[str, object]) -> Dict[str, object]:
     legs = signal.get("legs") or []
     confirmed_at_ts = int(time.time() * 1000)
+    intent_id = uuid.uuid4().hex
     detected_ts = _as_int(signal.get("detected_ts"))
     time_to_confirm_ms = None
     if detected_ts is not None:
         time_to_confirm_ms = confirmed_at_ts - detected_ts
     return {
+        "intent_id": intent_id,
         "type": "EXECUTION_INTENT",
         "event_id": signal.get("event_id"),
         "venues": [leg.get("venue") for leg in legs],
@@ -812,13 +968,15 @@ def _track_confirmed_signal(db_path: str, signal: Dict[str, object], intent: Dic
 
 
 def _hydrate_pending_signals(db_path: str) -> None:
-    global PENDING_SIGNALS_HYDRATED
-    if PENDING_SIGNALS_HYDRATED:
+    global PENDING_SIGNALS_HYDRATED_DB
+    if PENDING_SIGNALS_HYDRATED_DB == db_path:
         return
+    if PENDING_SIGNALS_HYDRATED_DB != db_path:
+        ACTIVE_CONFIRMED_SIGNALS.clear()
     for key, payload in fetch_pending_signals(db_path):
         if key and isinstance(payload, dict):
             ACTIVE_CONFIRMED_SIGNALS[key] = payload
-    PENDING_SIGNALS_HYDRATED = True
+    PENDING_SIGNALS_HYDRATED_DB = db_path
 
 
 def _backfill_execution_intent_durations(db_path: str, csv_path: str) -> None:
@@ -834,6 +992,9 @@ def _backfill_execution_intent_durations(db_path: str, csv_path: str) -> None:
         if not legs or size_usd is None or size_usd <= 0 or detected_ts is None:
             continue
         pnl = _reprice_signal_pnl(legs, size_usd)
+        tracked["last_eval_ts"] = now_ms
+        tracked["last_eval_pnl_usd"] = pnl
+        upsert_pending_signal(db_path, key, tracked, now_ms=now_ms)
         if pnl is None or pnl > 0:
             continue
         intent = dict(tracked.get("intent") or {})
@@ -876,13 +1037,20 @@ def _replace_execution_intent_csv_row(csv_path: str, intent: Dict[str, object]) 
     target = _execution_intent_row(intent)
     rows = _read_execution_intent_rows(csv_path)
     replaced = False
+    target_intent_id = str(target.get("intent_id") or "")
     for idx, row in enumerate(rows):
+        row_intent_id = str(row.get("intent_id") or "")
+        if target_intent_id and row_intent_id and row_intent_id == target_intent_id:
+            rows[idx] = target
+            replaced = True
+            break
         if (
             str(row.get("type") or "") == str(target.get("type") or "")
             and str(row.get("event_id") or "") == str(target.get("event_id") or "")
             and str(row.get("confirmed_at_ts") or "") == str(target.get("confirmed_at_ts") or "")
             and str(row.get("markets") or "") == str(target.get("markets") or "")
             and str(row.get("sides") or "") == str(target.get("sides") or "")
+            and str(row.get("signal_duration_ms") or "") == ""
         ):
             rows[idx] = target
             replaced = True
@@ -914,6 +1082,7 @@ def _write_execution_intent_rows(csv_path: str, rows: List[Dict[str, object]]) -
 
 def _execution_intent_row(intent: Dict[str, object]) -> Dict[str, object]:
     return {
+        "intent_id": intent.get("intent_id"),
         "type": intent.get("type"),
         "event_id": intent.get("event_id"),
         "venues": json.dumps(intent.get("venues") or [], separators=(",", ":")),
@@ -931,6 +1100,9 @@ def _execution_intent_row(intent: Dict[str, object]) -> Dict[str, object]:
 
 
 def _execution_intent_key(intent: Dict[str, object]) -> str:
+    intent_id = str(intent.get("intent_id") or "")
+    if intent_id:
+        return intent_id
     event_id = str(intent.get("event_id") or "")
     confirmed_at_ts = str(intent.get("confirmed_at_ts") or "")
     markets = json.dumps(intent.get("markets") or [], separators=(",", ":"))

@@ -10,3 +10,5 @@ __pycache__/
 *.pyc
 arbv2/fixtures/kalshi_game_series.json
 
+arbv2.db-wal
+arbv2.db-shm
