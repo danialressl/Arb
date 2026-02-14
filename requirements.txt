@@ -4,3 +4,4 @@ websockets
 pydantic
 PyYAML
 cryptography
+py-clob-client

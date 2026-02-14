@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Set, Tuple
 
 from arbv2.config import load_config
+from arbv2.execution import execute_confirmed_signal
 from arbv2.ingest.kalshi import ingest_kalshi
 from arbv2.ingest.polymarket import ingest_polymarket
 from arbv2.match.matcher import match_predicates
@@ -81,6 +82,31 @@ EXECUTION_INTENT_FIELDS = [
     "confirmed_at_ts",
     "time_to_confirm_ms",
     "signal_duration_ms",
+]
+ORDER_EXECUTIONS_CSV = "arbv2_order_executions.csv"
+ORDER_EXECUTION_FIELDS = [
+    "execution_id",
+    "intent_id",
+    "type",
+    "event_id",
+    "venues",
+    "markets",
+    "sides",
+    "limit_prices",
+    "size_usd",
+    "detected_ts",
+    "confirmed_at_ts",
+    "max_order_usd",
+    "contracts",
+    "target_spend_usd",
+    "actual_spend_usd",
+    "order_submitted_ts",
+    "order_confirmed_ts",
+    "order_confirm_ms",
+    "status",
+    "error_type",
+    "error_detail",
+    "leg_results",
 ]
 ACTIVE_CONFIRMED_SIGNALS: Dict[str, Dict[str, object]] = {}
 PENDING_SIGNALS_HYDRATED_DB: Optional[str] = None
@@ -156,6 +182,17 @@ def main() -> int:
         help="Seconds between ingest+match refreshes",
     )
     live_parser.add_argument("--poll-seconds", type=int, default=1, help="Kalshi poll cadence in seconds")
+    live_parser.add_argument(
+        "--execute-orders",
+        action="store_true",
+        help="Enable live order placement after confirm + post-confirm gates pass",
+    )
+    live_parser.add_argument(
+        "--max-order-usd",
+        type=float,
+        default=5.0,
+        help="Max USD spent per arbitrage opportunity when --execute-orders is enabled",
+    )
 
     args = parser.parse_args()
     config = load_config()
@@ -575,7 +612,12 @@ def _find_market(config, venue: str, market_id: str) -> Optional[Market]:
     return None
 
 
-async def _run_arb_stream(config) -> None:
+async def _run_arb_stream(
+    config,
+    *,
+    execute_orders: bool = False,
+    max_order_usd: float = 5.0,
+) -> None:
     kalshi_markets = fetch_markets(config.db_path, venue="kalshi")
     poly_markets = fetch_markets(config.db_path, venue="polymarket")
     matched_pairs = set(fetch_match_pairs(config.db_path))
@@ -595,6 +637,9 @@ async def _run_arb_stream(config) -> None:
         events_binary,
         title_by_market_id,
         matched_pairs,
+        config=config,
+        execute_orders=execute_orders,
+        max_order_usd=max_order_usd,
     )
 
     loop = asyncio.get_running_loop()
@@ -649,6 +694,9 @@ async def _run_arb_stream(config) -> None:
                 scan_binary,
                 title_by_market_id,
                 matched_pairs,
+                config=config,
+                execute_orders=execute_orders,
+                max_order_usd=max_order_usd,
             )
     finally:
         unsubscribe_orderbook_updates(subscriber_token)
@@ -660,9 +708,31 @@ def _scan_arb_cycle(
     events_binary: List[EventMarkets],
     title_by_market_id: Dict[str, str],
     matched_pairs: Optional[Set[Tuple[str, str]]] = None,
+    *,
+    config=None,
+    execute_orders: bool = False,
+    max_order_usd: float = 5.0,
 ) -> None:
-    _scan_arb_events(db_path, events_event, ArbMode.EVENT_OUTCOME, title_by_market_id, matched_pairs)
-    _scan_arb_events(db_path, events_binary, ArbMode.BINARY_MIRROR, title_by_market_id, matched_pairs)
+    _scan_arb_events(
+        db_path,
+        events_event,
+        ArbMode.EVENT_OUTCOME,
+        title_by_market_id,
+        matched_pairs,
+        config=config,
+        execute_orders=execute_orders,
+        max_order_usd=max_order_usd,
+    )
+    _scan_arb_events(
+        db_path,
+        events_binary,
+        ArbMode.BINARY_MIRROR,
+        title_by_market_id,
+        matched_pairs,
+        config=config,
+        execute_orders=execute_orders,
+        max_order_usd=max_order_usd,
+    )
 
 
 def _index_events_by_leg(events: List[EventMarkets]) -> Dict[Tuple[str, str], List[EventMarkets]]:
@@ -723,6 +793,9 @@ def _run_live(config, args) -> int:
     if args.interval_seconds <= 0:
         logger.warning("Interval must be positive; got %d", args.interval_seconds)
         return 0
+    if args.max_order_usd <= 0:
+        logger.warning("max-order-usd must be positive; got %.4f", args.max_order_usd)
+        return 0
     try:
         asyncio.run(
             _run_live_loop(
@@ -732,6 +805,8 @@ def _run_live(config, args) -> int:
                 interval_seconds=args.interval_seconds,
                 poll_seconds=args.poll_seconds,
                 limit=args.limit,
+                execute_orders=args.execute_orders,
+                max_order_usd=args.max_order_usd,
             )
         )
     except KeyboardInterrupt:
@@ -747,6 +822,8 @@ async def _run_live_loop(
     interval_seconds: int,
     poll_seconds: int,
     limit: Optional[int],
+    execute_orders: bool,
+    max_order_usd: float,
 ) -> None:
     cycle = 0
     while True:
@@ -765,7 +842,15 @@ async def _run_live_loop(
             tasks.append(asyncio.create_task(stream_poly_books(config, poly_token_map, config.db_path)))
         if enable_kalshi and kalshi_markets:
             tasks.append(asyncio.create_task(stream_kalshi_books(config, kalshi_markets, config.db_path)))
-        tasks.append(asyncio.create_task(_run_arb_stream(config)))
+        tasks.append(
+            asyncio.create_task(
+                _run_arb_stream(
+                    config,
+                    execute_orders=execute_orders,
+                    max_order_usd=max_order_usd,
+                )
+            )
+        )
         tasks.append(asyncio.create_task(_run_intent_backfill_loop(config.db_path, EXECUTION_INTENTS_CSV)))
         if not tasks:
             logger.warning("No price streams to run; sleeping %d seconds", interval_seconds)
@@ -785,6 +870,10 @@ def _scan_arb_events(
     mode: ArbMode,
     title_by_market_id: Dict[str, str],
     matched_pairs: Optional[Set[Tuple[str, str]]] = None,
+    *,
+    config=None,
+    execute_orders: bool = False,
+    max_order_usd: float = 5.0,
 ) -> None:
     _backfill_execution_intent_durations(db_path, EXECUTION_INTENTS_CSV)
     scan_rows: List[tuple] = []
@@ -862,6 +951,40 @@ def _scan_arb_events(
             logger.info("EXECUTION_INTENT %s", json.dumps(intent, separators=(",", ":")))
             _append_execution_intent_csv(intent, EXECUTION_INTENTS_CSV)
             _track_confirmed_signal(db_path, signal, intent, EXECUTION_INTENTS_CSV)
+            if execute_orders:
+                if config is None:
+                    order_execution = _order_execution_error_row(
+                        signal=signal,
+                        intent=intent,
+                        max_order_usd=max_order_usd,
+                        error_type="missing_config",
+                        error_detail="Execution enabled but config was not provided to scan loop.",
+                    )
+                else:
+                    order_execution = execute_confirmed_signal(
+                        config,
+                        db_path=db_path,
+                        signal=signal,
+                        decision=post_decision,
+                        intent=intent,
+                        max_order_usd=max_order_usd,
+                    )
+                _append_order_execution_csv(order_execution, ORDER_EXECUTIONS_CSV)
+                if order_execution.get("status") == "confirmed":
+                    logger.info(
+                        "ORDER_EXECUTION_CONFIRMED intent_id=%s order_confirm_ms=%s contracts=%s spend=%.4f",
+                        order_execution.get("intent_id"),
+                        order_execution.get("order_confirm_ms"),
+                        order_execution.get("contracts"),
+                        float(order_execution.get("actual_spend_usd") or 0.0),
+                    )
+                else:
+                    logger.warning(
+                        "ORDER_EXECUTION_FAILED intent_id=%s error_type=%s error_detail=%s",
+                        order_execution.get("intent_id"),
+                        order_execution.get("error_type"),
+                        order_execution.get("error_detail"),
+                    )
             _log_signal_details(signal)
             continue
         _append_arb_csv(signal, "arbv2_arbs.csv")
@@ -928,6 +1051,52 @@ def _append_execution_intent_csv(intent: Dict[str, object], csv_path: str) -> No
     rows = _read_execution_intent_rows(csv_path)
     rows.append(_execution_intent_row(intent))
     _write_execution_intent_rows(csv_path, rows)
+
+
+def _append_order_execution_csv(execution: Dict[str, object], csv_path: str) -> None:
+    row = _order_execution_row(execution)
+    write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+    with open(csv_path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=ORDER_EXECUTION_FIELDS)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({field: row.get(field, "") for field in ORDER_EXECUTION_FIELDS})
+
+
+def _order_execution_error_row(
+    *,
+    signal: Dict[str, object],
+    intent: Dict[str, object],
+    max_order_usd: float,
+    error_type: str,
+    error_detail: str,
+) -> Dict[str, object]:
+    now_ms = int(time.time() * 1000)
+    legs = signal.get("legs") or []
+    return {
+        "execution_id": uuid.uuid4().hex,
+        "intent_id": intent.get("intent_id"),
+        "type": "ORDER_EXECUTION",
+        "event_id": intent.get("event_id") or signal.get("event_id"),
+        "venues": [leg.get("venue") for leg in legs],
+        "markets": [leg.get("market_id") for leg in legs],
+        "sides": [leg.get("side") for leg in legs],
+        "limit_prices": [],
+        "size_usd": intent.get("size_usd") or signal.get("size"),
+        "detected_ts": intent.get("detected_ts") or signal.get("detected_ts"),
+        "confirmed_at_ts": intent.get("confirmed_at_ts"),
+        "max_order_usd": max_order_usd,
+        "contracts": None,
+        "target_spend_usd": max_order_usd,
+        "actual_spend_usd": None,
+        "order_submitted_ts": now_ms,
+        "order_confirmed_ts": now_ms,
+        "order_confirm_ms": 0,
+        "status": "error",
+        "error_type": error_type,
+        "error_detail": error_detail,
+        "leg_results": [],
+    }
 
 
 def _track_confirmed_signal(db_path: str, signal: Dict[str, object], intent: Dict[str, object], csv_path: str) -> None:
@@ -1096,6 +1265,36 @@ def _execution_intent_row(intent: Dict[str, object]) -> Dict[str, object]:
         "confirmed_at_ts": intent.get("confirmed_at_ts"),
         "time_to_confirm_ms": intent.get("time_to_confirm_ms"),
         "signal_duration_ms": intent.get("signal_duration_ms"),
+    }
+
+
+def _order_execution_row(execution: Dict[str, object]) -> Dict[str, object]:
+    def _json_cell(value: object) -> str:
+        return json.dumps(value if value is not None else [], separators=(",", ":"), default=str)
+
+    return {
+        "execution_id": execution.get("execution_id"),
+        "intent_id": execution.get("intent_id"),
+        "type": execution.get("type") or "ORDER_EXECUTION",
+        "event_id": execution.get("event_id"),
+        "venues": _json_cell(execution.get("venues")),
+        "markets": _json_cell(execution.get("markets")),
+        "sides": _json_cell(execution.get("sides")),
+        "limit_prices": _json_cell(execution.get("limit_prices")),
+        "size_usd": execution.get("size_usd"),
+        "detected_ts": execution.get("detected_ts"),
+        "confirmed_at_ts": execution.get("confirmed_at_ts"),
+        "max_order_usd": execution.get("max_order_usd"),
+        "contracts": execution.get("contracts"),
+        "target_spend_usd": execution.get("target_spend_usd"),
+        "actual_spend_usd": execution.get("actual_spend_usd"),
+        "order_submitted_ts": execution.get("order_submitted_ts"),
+        "order_confirmed_ts": execution.get("order_confirmed_ts"),
+        "order_confirm_ms": execution.get("order_confirm_ms"),
+        "status": execution.get("status"),
+        "error_type": execution.get("error_type"),
+        "error_detail": execution.get("error_detail"),
+        "leg_results": _json_cell(execution.get("leg_results")),
     }
 
 
