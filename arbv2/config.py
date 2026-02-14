@@ -67,6 +67,10 @@ class Config:
     polymarket_clob_api_key: str = _env_str("POLY_CLOB_API_KEY", "")
     polymarket_clob_api_secret: str = _env_str("POLY_CLOB_API_SECRET", "")
     polymarket_clob_api_passphrase: str = _env_str("POLY_CLOB_API_PASSPHRASE", "")
+    polymarket_private_key: str = _env_str("POLY_PRIVATE_KEY", "")
+    polymarket_chain_id: int = _env_int("POLY_CHAIN_ID", 137)
+    polymarket_signature_type: int = _env_int("POLY_SIGNATURE_TYPE", 0)
+    polymarket_funder: str = _env_str("POLY_FUNDER", "")
 
 
 def load_config() -> Config:

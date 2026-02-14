@@ -36,6 +36,13 @@ Polymarket CLOB auth:
 - `POLY_CLOB_API_SECRET`
 - `POLY_CLOB_API_PASSPHRASE`
 
+Additional env vars required only when live order execution is enabled:
+
+- `POLY_PRIVATE_KEY` (EOA private key used to sign CLOB orders)
+- `POLY_CHAIN_ID` (default `137`)
+- `POLY_SIGNATURE_TYPE` (default `0`)
+- `POLY_FUNDER` (optional funder address for delegated signing flows)
+
 Optional endpoints/defaults:
 
 - `KALSHI_BASE_URL` default `https://api.elections.kalshi.com/trade-api/v2`
@@ -64,6 +71,7 @@ python -m arbv2 match
 python -m arbv2 health
 python -m arbv2 price --stream
 python -m arbv2 live
+python -m arbv2 live --execute-orders --max-order-usd 5
 ```
 
 Also available:
@@ -77,6 +85,7 @@ Notes:
 - `live` currently purges `arbv2.db`, `arbv2.db-wal`, `arbv2.db-shm`, and `arbv2.db-journal` at startup.
 - `price --stream` and `live` run websocket-only pricing paths.
 - Kalshi snapshot polling is not used; use `--stream`.
+- Live orders are disabled by default and only run when `live --execute-orders` is set.
 
 ## Runtime Behavior
 
@@ -96,6 +105,8 @@ Notes:
   - includes `time_to_confirm_ms` and `signal_duration_ms`
 - `arbv2_confirm_rejections.csv`
   - only created/written when rejects occur
+- `arbv2_order_executions.csv`
+  - written only when `--execute-orders` is enabled; includes order confirmation latency and error types
 
 ### SQLite (`arbv2.db`)
 
